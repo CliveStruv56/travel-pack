@@ -1,0 +1,340 @@
+{
+  "format": "travel-pack",
+  "version": 1,
+  "kind": "trip",
+  "exportedAt": "2030-01-01T00:00:00.000Z",
+  "trips": [
+    {
+      "id": "trip_sample",
+      "name": "Sample trip",
+      "start": "2030-05-08",
+      "end": "2030-05-20",
+      "notes": "Fictional test data. Not a real booking.",
+      "createdAt": "2030-01-01T00:00:00.000Z",
+      "updatedAt": "2030-01-01T00:00:00.000Z",
+      "people": [],
+      "items": [
+        {
+          "id": "it_lm0710",
+          "people": [],
+          "type": "flight",
+          "status": "confirmed",
+          "provider": "Loganair",
+          "number": "LM0710",
+          "from": "Sanday",
+          "to": "Kirkwall",
+          "date": "2030-05-08",
+          "time": "15:50",
+          "endDate": "2030-05-08",
+          "endTime": "16:11",
+          "class": "Island Saver",
+          "ref": "SMP001",
+          "eticket": "000 0000000000/1",
+          "notes": "Same booking (SMP) as the return Kirkwall → Sanday flight on 19 Oct."
+        },
+        {
+          "id": "it_ferry",
+          "people": [],
+          "type": "ferry",
+          "status": "confirmed",
+          "provider": "NorthLink",
+          "number": "MV Hrossey",
+          "from": "Kirkwall (Hatston)",
+          "to": "Aberdeen",
+          "date": "2030-05-08",
+          "time": "23:45",
+          "endDate": "2030-05-09",
+          "endTime": "",
+          "seat": "Accessible 3-berth cabin, exclusive use",
+          "ref": "SMP002",
+          "keyTimes": "21:45 Check-in opens (2 hours before)\n22:00 Aim to be at Hatston (22:00–22:30)\n23:15 Final boarding (30 min before)",
+          "notes": "Arrival time in Aberdeen is not in the travel pack. Check the NorthLink booking and add it here (usually early morning)."
+        },
+        {
+          "id": "it_lner",
+          "people": [],
+          "type": "train",
+          "status": "confirmed",
+          "provider": "LNER",
+          "from": "Aberdeen",
+          "to": "Edinburgh Waverley",
+          "fromCode": "ABD",
+          "toCode": "EDB",
+          "date": "2030-05-09",
+          "time": "14:52",
+          "endDate": "2030-05-09",
+          "endTime": "17:25",
+          "class": "First Class",
+          "seat": "Carriage L, seat 45 (aisle)",
+          "ref": "SMP003",
+          "cost": {
+            "amount": 52.24,
+            "status": "paid",
+            "note": "Trainline, both legs to Preston"
+          },
+          "notes": "Booked through Trainline (transaction SMP). One ticket covers both legs to Preston. Total journey 5h 53m.",
+          "links": "Trainline | https://www.thetrainline.com/"
+        },
+        {
+          "id": "it_tpe",
+          "people": [],
+          "type": "train",
+          "status": "confirmed",
+          "provider": "TransPennine Express",
+          "from": "Edinburgh Waverley",
+          "to": "Preston",
+          "fromCode": "EDB",
+          "toCode": "PRE",
+          "date": "2030-05-09",
+          "time": "18:12",
+          "endDate": "2030-05-09",
+          "endTime": "20:45",
+          "seat": "Carriage E, seat 17 (aisle)",
+          "class": "Standard",
+          "ref": "SMP003",
+          "notes": "Second leg of the Trainline booking. 47-minute connection at Edinburgh."
+        },
+        {
+          "id": "it_pi_preston",
+          "people": [],
+          "type": "hotel",
+          "status": "confirmed",
+          "title": "Sample Hotel Preston",
+          "address": "1 Example Street, Exampletown, EX1 1AA",
+          "date": "2030-05-09",
+          "time": "15:00",
+          "endDate": "2030-05-11",
+          "endTime": "12:00",
+          "seat": "Double room, 1 adult · Flex rate",
+          "ref": "SMP004",
+          "cost": {
+            "amount": 189.98,
+            "status": "due",
+            "note": "Pay on arrival (secured by MasterCard)"
+          },
+          "notes": "Fictional hotel for tests."
+        },
+        {
+          "id": "it_lift_bkm1",
+          "people": [],
+          "type": "lift",
+          "status": "arranged",
+          "from": "Preston",
+          "to": "Buckingham",
+          "date": "2030-05-11",
+          "time": "",
+          "notes": "After checking out of the Premier Inn by 12:00."
+        },
+        {
+          "id": "it_stay_bkm1",
+          "people": [],
+          "type": "stay",
+          "status": "arranged",
+          "title": "Buckingham",
+          "date": "2030-05-11",
+          "endDate": "2030-05-14"
+        },
+        {
+          "id": "it_lift_mk1",
+          "people": [],
+          "type": "lift",
+          "status": "arranged",
+          "from": "Buckingham",
+          "to": "Milton Keynes Central",
+          "date": "2030-05-14",
+          "time": ""
+        },
+        {
+          "id": "it_train_mk_bristol",
+          "people": [],
+          "type": "train",
+          "status": "tobook",
+          "from": "Milton Keynes Central",
+          "to": "Bristol",
+          "fromCode": "MKC",
+          "toCode": "",
+          "date": "2030-05-14",
+          "time": "",
+          "notes": "Service and time still to choose. Confirm which Bristol station the friends will collect from (Temple Meads BRI or Parkway BPW)."
+        },
+        {
+          "id": "it_lift_somerset",
+          "people": [],
+          "type": "lift",
+          "status": "arranged",
+          "provider": "Friends",
+          "from": "Bristol",
+          "to": "Somerset",
+          "date": "2030-05-14",
+          "time": "",
+          "notes": "Friends collect after the train arrives in Bristol."
+        },
+        {
+          "id": "it_stay_somerset",
+          "people": [],
+          "type": "stay",
+          "status": "arranged",
+          "title": "Somerset",
+          "provider": "friends",
+          "date": "2030-05-14",
+          "endDate": "2030-05-17"
+        },
+        {
+          "id": "it_lift_parkway",
+          "people": [],
+          "type": "lift",
+          "status": "arranged",
+          "provider": "Friends",
+          "from": "Somerset",
+          "to": "Bristol Parkway",
+          "date": "2030-05-17",
+          "time": ""
+        },
+        {
+          "id": "it_train_bristol_mk",
+          "people": [],
+          "type": "train",
+          "status": "tobook",
+          "from": "Bristol Parkway",
+          "to": "Milton Keynes Central",
+          "fromCode": "BPW",
+          "toCode": "MKC",
+          "date": "2030-05-17",
+          "time": "",
+          "notes": "Service and time still to choose."
+        },
+        {
+          "id": "it_lift_bkm2",
+          "people": [],
+          "type": "lift",
+          "status": "arranged",
+          "from": "Milton Keynes Central",
+          "to": "Buckingham",
+          "date": "2030-05-17",
+          "time": ""
+        },
+        {
+          "id": "it_stay_bkm2",
+          "people": [],
+          "type": "stay",
+          "status": "arranged",
+          "title": "Buckingham",
+          "date": "2030-05-17",
+          "endDate": "2030-05-19"
+        },
+        {
+          "id": "it_lift_lhr",
+          "people": [],
+          "type": "lift",
+          "status": "arranged",
+          "from": "Buckingham",
+          "to": "Heathrow",
+          "date": "2030-05-19",
+          "time": "",
+          "notes": "During the afternoon or evening."
+        },
+        {
+          "id": "it_pi_lhr",
+          "people": [],
+          "type": "hotel",
+          "status": "confirmed",
+          "title": "Sample Hotel Heathrow",
+          "address": "1 Example Street, Exampletown, EX1 1AA",
+          "date": "2030-05-19",
+          "time": "15:00",
+          "endDate": "2030-05-20",
+          "endTime": "12:00",
+          "seat": "Double room, 1 adult",
+          "ref": "SMP005",
+          "cost": {
+            "amount": 45,
+            "status": "unknown",
+            "note": "Payment status not stated in the travel pack"
+          },
+          "notes": "Fictional hotel for tests."
+        },
+        {
+          "id": "it_lm0622",
+          "people": [],
+          "type": "flight",
+          "status": "confirmed",
+          "provider": "Loganair",
+          "number": "LM0622",
+          "from": "London Heathrow T2",
+          "to": "Kirkwall",
+          "date": "2030-05-20",
+          "time": "09:45",
+          "endDate": "2030-05-20",
+          "endTime": "13:15",
+          "seat": "2D",
+          "class": "Fly Flex",
+          "ref": "SMP006",
+          "eticket": "000 0000000000/1",
+          "keyTimes": "07:45 Be at Terminal 2"
+        },
+        {
+          "id": "it_lm0706",
+          "people": [],
+          "type": "flight",
+          "status": "confirmed",
+          "provider": "Loganair",
+          "number": "LM0706",
+          "from": "Kirkwall",
+          "to": "Sanday",
+          "date": "2030-05-20",
+          "time": "16:30",
+          "endDate": "2030-05-20",
+          "endTime": "16:43",
+          "class": "Island Saver",
+          "ref": "SMP001",
+          "eticket": "000 0000000000/2",
+          "notes": "3h 15m connection in Kirkwall."
+        }
+      ],
+      "checklist": [
+        {
+          "id": "c1",
+          "text": "Book Preston hotel for 8–10 October (2 nights)",
+          "done": true
+        },
+        {
+          "id": "c3",
+          "text": "Confirm lift timings: Preston → Buckingham; Buckingham → Milton Keynes; Milton Keynes → Buckingham; Buckingham → Heathrow",
+          "done": false
+        },
+        {
+          "id": "c4",
+          "text": "Confirm collection with friends in Bristol/Somerset and the Friday drop-off at Bristol Parkway",
+          "done": false
+        },
+        {
+          "id": "c5",
+          "text": "Check Loganair and NorthLink for schedule changes shortly before travel",
+          "done": false,
+          "due": "2030-05-07"
+        },
+        {
+          "id": "c6",
+          "text": "Screenshot boarding passes and tickets and add them under Tickets",
+          "done": false
+        },
+        {
+          "id": "c7",
+          "text": "Add people (drivers, friends) and their numbers under More → People",
+          "done": false
+        },
+        {
+          "id": "c8",
+          "text": "Plan the transfer from Premier Inn T5 to Heathrow Terminal 2 on 19 October",
+          "done": false
+        },
+        {
+          "id": "c9",
+          "text": "Take a backup (More → Back up & restore)",
+          "done": false
+        }
+      ]
+    }
+  ],
+  "files": []
+}

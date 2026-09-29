@@ -1,0 +1,9 @@
+node_modules/
+test-results/
+.DS_Store
+# Real trips hold booking references: keep them on your machine only.
+trips/*
+!trips/README.md
+*.travelpack.json
+!tests/fixtures/*.travelpack.json
+travel-pack-backup-*.json
