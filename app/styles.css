@@ -455,3 +455,6 @@ input[type=date], input[type=time] { min-width: 0; -webkit-appearance: none; app
 
 .type-opt, .seg label { position: relative; }
 .type-opt input, .seg input { width: 1px; height: 1px; min-height: 0; padding: 0; }
+
+.add-card { padding: 14px; margin-bottom: 12px; }
+.kvs-mini { display: flex; flex-wrap: wrap; gap: 6px 14px; margin-top: 10px; font-size: 14px; color: var(--ink-2); font-weight: 500; }

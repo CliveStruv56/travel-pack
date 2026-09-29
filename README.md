@@ -58,6 +58,14 @@ npm run link -- https://clivestruv56.github.io/travel-pack/ trips/october-2026.t
 ```
 The trip is carried in the part of the link after `#`, which browsers never send to a server.
 
+To add or correct one or more bookings in a trip that's already on the phone, without touching
+anything else in it, write the booking(s) as JSON (same fields as in a trip file) and make an add link:
+```bash
+npm run add-link -- https://clivestruv56.github.io/travel-pack/ trips/new-hotel.json trip_oct2026
+```
+Opening it shows the booking and an **Add to my trip** button. A booking whose `id` already exists
+in the trip is replaced rather than duplicated.
+
 ## Layout
 ```
 app/        the whole app (static files, served as-is)

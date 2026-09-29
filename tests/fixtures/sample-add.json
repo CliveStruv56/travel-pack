@@ -1,0 +1,14 @@
+{
+  "id": "it_sample_added_hotel",
+  "type": "hotel",
+  "status": "confirmed",
+  "title": "Sample Hotel Replacement",
+  "address": "2 Example Street, Exampletown, EX1 1AB",
+  "date": "2030-05-09",
+  "time": "15:00",
+  "endDate": "2030-05-11",
+  "endTime": "12:00",
+  "seat": "Double room, 1 adult · Standard rate",
+  "ref": "SMP900",
+  "cost": { "amount": 99.5, "status": "paid", "note": "Prepaid" }
+}

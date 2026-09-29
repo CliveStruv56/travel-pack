@@ -22,6 +22,10 @@ bookings and ticket barcodes on an Android phone. See README.md for features and
   When changing the shape of a trip or item, keep old data readable (migrate on load). Do not rename fields in place.
   Backup and restore must round-trip, and the e2e test covers it.
 - **Render through `html```** (in `util.js`). It escapes interpolated values. Use `raw()` only for markup you built.
+- Links: `#share=` opens a whole trip (read-only unless the payload says `editable`), `#add=` merges bookings
+  into an existing trip by item `id` (`npm run add-link`). Both are deflate-raw + base64url after the `#`,
+  so the data never reaches the server. Never make a link that replaces a whole trip the user already has:
+  it would wipe their people, ticked to-dos and edits.
 - Headless Linux Chromium has no `BarcodeDetector`, so tests fake the detected box. Barcode detection itself
   can only be verified on an Android phone.
 - Deploy is `.github/workflows/ci.yml`: tests on every push and PR, then GitHub Pages from `main`.

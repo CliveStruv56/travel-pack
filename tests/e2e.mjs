@@ -184,6 +184,32 @@ await section('Setup link loads an editable trip', async () => {
   await c3.close();
 });
 
+await section('Add-booking link adds to the existing trip', async () => {
+  const before = await p.evaluate(() => window.__tp.S.trips[0].items.length);
+  await p.evaluate(async () => { const t = window.__tp.S.trips[0]; t.people.push({ id: 'p_keep', name: 'Kept' }); });
+  const link = execFileSync('node', [new URL('../tools/make-add-link.mjs', import.meta.url).pathname, `${BASE}?now=2030-05-08T12:00`, new URL('./fixtures/sample-add.json', import.meta.url).pathname, 'trip_sample']).toString().trim();
+  await p.goto(link);
+  await p.waitForSelector('.add-card');
+  ok((await p.textContent('.add-card')).includes('SMP900'), 'preview shows the booking');
+  await shot(p, '05-add-link');
+  await p.click('[data-act=apply-add]');
+  await p.waitForSelector('.d-head');
+  ok((await p.textContent('.d-head')).includes('Sample Hotel Replacement'), 'opens the added booking');
+  const t = await p.evaluate(() => window.__tp.S.trips[0]);
+  ok(t.items.length === before + 1, 'one booking added, nothing removed');
+  ok(t.items.some((i) => i.ref === 'TESTREF1'), 'earlier edits kept');
+  // Opening the same link again replaces rather than duplicates.
+  await p.goto(link);
+  await p.waitForSelector('.add-card');
+  ok((await p.textContent('.add-card')).includes('replaces the existing one'), 'second open says it will replace');
+  await p.click('[data-act=apply-add]');
+  await p.waitForSelector('.d-head');
+  ok((await p.evaluate(() => window.__tp.S.trips[0].items.length)) === before + 1, 'no duplicate on second open');
+  await p.goto(`${BASE}#add=garbage`);
+  await p.waitForTimeout(300);
+  ok(!(await p.$('.add-card')), 'a broken link is rejected');
+});
+
 await section('Backup and restore', async () => {
   await p.goto(at('2030-05-08T12:00', 'backup'));
   const [dl] = await Promise.all([p.waitForEvent('download'), p.click('[data-act=backup-download]')]);

@@ -53,6 +53,28 @@ export async function readShareLink(fragment) {
   return payload;
 }
 
+/**
+ * "Add booking" link: carries one or more bookings to drop into an existing
+ * trip without touching anything else in it. A booking whose id is already in
+ * the trip replaces it, so the same kind of link can also correct a booking.
+ */
+export async function addLink(items, { tripId = '', base } = {}) {
+  const payload = { v: 1, kind: 'add', tripId, sharedAt: new Date().toISOString(), items };
+  const root = (base || location.href).split('#')[0].split('?')[0];
+  return `${root}#add=${await compress(JSON.stringify(payload))}`;
+}
+
+export async function readAddLink(fragment) {
+  const payload = JSON.parse(await decompress(fragment.replace(/^#?add=/, '')));
+  if (!payload || payload.v !== 1 || payload.kind !== 'add' || !Array.isArray(payload.items) || !payload.items.length) {
+    throw new Error('Not a Travel Pack booking link');
+  }
+  for (const it of payload.items) {
+    if (!it || typeof it.id !== 'string' || !it.type || !it.date) throw new Error('A booking in this link is incomplete');
+  }
+  return payload;
+}
+
 /** Plain-text itinerary for WhatsApp / SMS / email. */
 export function shareText(trip, opts) {
   const t = redact(trip, opts);

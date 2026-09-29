@@ -6,7 +6,7 @@ import {
   buildDays, tonight, moments, toBook, costs, liveLinks, stationCode, newTrip, mapsUrl, telHref, whatsappHref,
 } from './model.js';
 import { tripToIcs, googleCalendarUrl } from './ics.js';
-import { shareLink, readShareLink, shareText, exportBundle, parseBundle } from './share.js';
+import { shareLink, readShareLink, readAddLink, shareText, exportBundle, parseBundle } from './share.js';
 
 const APP_VERSION = '1.0.0';
 
@@ -21,6 +21,7 @@ const S = {
   route: { name: 'today', parts: [] },
   online: navigator.onLine,
   preview: null,        // a trip opened from a share link, not yet saved
+  incoming: null,       // bookings opened from an "add booking" link, not yet added
   draft: null,          // item being edited
   inbox: [],            // files shared into the app from other Android apps
   me: '',               // traveller name, used when sharing
@@ -130,8 +131,18 @@ async function onRoute() {
       history.replaceState(null, '', '#/today');
     }
   }
+  if (location.hash.startsWith('#add=')) {
+    try {
+      S.incoming = await readAddLink(location.hash.slice(1));
+      history.replaceState(null, '', '#/add');
+    } catch (e) {
+      toast('That booking link could not be read. It may have been cut short when it was copied.');
+      history.replaceState(null, '', '#/today');
+    }
+  }
   const prev = S.route;
   S.route = parseRoute();
+  if (S.route.name === 'add' && !S.incoming) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
   if (S.route.name === 'shared' && !S.preview) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
   if (S.route.name === 'inbox') await refreshInbox();
   if (S.route.name !== 'edit' && S.route.name !== 'new') S.draft = null;
@@ -845,6 +856,34 @@ VIEWS.backup = () => {
   </div>`;
 };
 
+VIEWS.add = () => {
+  const p = S.incoming;
+  const editable = S.trips.filter((t) => !t.readOnly);
+  const target = editable.find((t) => t.id === p.tripId) || editable.find((t) => t.id === S.tripId) || editable[0];
+  return html`${subBar(p.items.length === 1 ? 'Add booking' : `Add ${p.items.length} bookings`, 'today')}<div class="page">
+    <p class="lead">From a Travel Pack link. Nothing else in your trip changes.</p>
+    ${p.items.map((it) => {
+      const T = typeOf(it);
+      const exists = S.trips.some((t) => t.items.some((x) => x.id === it.id));
+      return html`<div class="card add-card t-${it.type}">
+        <div class="entry-top"><span class="tile">${icon(T.icon)}</span><span class="entry-kicker">${T.label}${exists ? ' · replaces the existing one' : ''}</span>${chip(it.status)}</div>
+        <div class="entry-title">${itemTitle(it)}</div>
+        ${itemSubtitle(it) ? html`<div class="entry-sub">${itemSubtitle(it)}</div>` : ''}
+        <div class="kvs-mini">
+          <span>${fmtDay(it.date)}${it.time ? ` · ${it.time}` : ''}${it.endDate && it.endDate !== it.date ? ` → ${fmtDay(it.endDate)}${it.endTime ? ` · ${it.endTime}` : ''}` : ''}</span>
+          ${it.ref ? html`<span class="mono">${it.ref}</span>` : ''}
+          ${it.cost && Number(it.cost.amount) ? html`<span>${money(it.cost.amount)} · ${COST_STATUS[it.cost.status || 'unknown']}</span>` : ''}
+        </div></div>`;
+    })}
+    ${target ? html`<form data-form="add" onsubmit="return false">
+      ${editable.length > 1 ? html`<label class="fld"><span>Add to trip</span><select name="tripId">${editable.map((t) => html`<option value="${t.id}" ${t.id === target.id ? raw('selected') : ''}>${t.name} · ${fmtRange(t.start, t.end)}</option>`)}</select></label>`
+        : html`<input type="hidden" name="tripId" value="${target.id}"><p class="hint">Adding to <b>${target.name}</b> (${fmtRange(target.start, target.end)}).</p>`}
+      <button class="btn primary wide" data-act="apply-add">${icon('plus')} Add to my trip</button>
+      <a class="btn ghost wide" href="#/today" data-act="close-add">Not now</a>
+    </form>` : html`<div class="banner warn">${icon('alert', 'sm')}<div><b>No trip to add it to</b><span>Create or import a trip first, then open this link again.</span></div></div>`}
+  </div>`;
+};
+
 VIEWS.inbox = (t) => {
   const items = t ? [...t.items].sort((a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || ''))) : [];
   return html`${subBar('Shared files', 'tickets')}<div class="page">
@@ -1309,6 +1348,21 @@ const ACT = {
     go('today');
   },
   'close-preview': () => { S.preview = null; },
+  'close-add': () => { S.incoming = null; },
+  async 'apply-add'(el, e) {
+    e.preventDefault();
+    const fd = new FormData(el.closest('form'));
+    const t = S.trips.find((x) => x.id === fd.get('tripId'));
+    if (!t) return;
+    const items = S.incoming.items.map((it) => ({ people: [], ...structuredClone(it) }));
+    for (const it of items) putItem(t, it);
+    S.incoming = null;
+    await saveTrip(t, { quiet: true });
+    if (S.tripId !== t.id) await setCurrentTrip(t.id);
+    toast(items.length === 1 ? 'Booking added' : `${items.length} bookings added`);
+    history.replaceState(null, '', `#/item/${items[0].id}`);
+    onRoute();
+  },
   async 'make-editable'() {
     const t = trip();
     if (!(await confirmBox('Make this an editable copy? It will no longer update from share links.', 'Make editable', false))) return;
@@ -1363,6 +1417,19 @@ async function doBackup(share) {
   }
 }
 
+/** Add or replace a booking, keeping date order and the trip's date range. */
+function putItem(t, d) {
+  const i = t.items.findIndex((x) => x.id === d.id);
+  if (i >= 0) t.items[i] = d;
+  else {
+    // Insert in date order so untimed items keep a sensible position.
+    const at = t.items.findIndex((x) => (x.date + (x.time || '')) > (d.date + (d.time || '99')));
+    if (at < 0) t.items.push(d); else t.items.splice(at, 0, d);
+  }
+  if (!t.start || d.date < t.start) t.start = d.date;
+  if (!t.end || (d.endDate || d.date) > t.end) t.end = d.endDate || d.date;
+}
+
 const FORMS = {
   async item(fd, form) {
     const t = trip();
@@ -1375,15 +1442,7 @@ const FORMS = {
     if (d.endTime && !d.endDate) d.endDate = d.date;
     if (d.endDate && d.endDate < d.date) { toast(`${typeOf(d).when[1]} is before ${typeOf(d).when[0].toLowerCase()}.`); return; }
     if (d.endDate === d.date && d.time && d.endTime && d.endTime < d.time && isTransport(d)) d.endDate = addDays(d.date, 1);
-    const i = t.items.findIndex((x) => x.id === d.id);
-    if (i >= 0) t.items[i] = d;
-    else {
-      // Insert in date order so untimed items keep a sensible position.
-      const at = t.items.findIndex((x) => (x.date + (x.time || '')) > (d.date + (d.time || '99')));
-      if (at < 0) t.items.push(d); else t.items.splice(at, 0, d);
-    }
-    if (d.date < t.start) t.start = d.date;
-    if ((d.endDate || d.date) > t.end) t.end = d.endDate || d.date;
+    putItem(t, d);
     S.draft = null;
     await saveTrip(t, { quiet: true });
     toast('Saved');
