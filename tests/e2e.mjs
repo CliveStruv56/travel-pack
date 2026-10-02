@@ -313,9 +313,23 @@ await section('Journal', async () => {
   await p.waitForSelector('.journal-entry');
   ok((await p.textContent('.journal-entry')).includes('Fish supper'), 'entry saved');
   await p.click('.journal-entry [data-act=add-files]');
+  ok((await p.getAttribute('#file-input', 'accept')) === 'image/*', 'journal picker offers images only');
   await p.setInputFiles('#file-input', OUT + 'fake-pass.png');
-  await p.waitForSelector('.journal-entry .thumb:not(.add)');
-  ok(true, 'photo added to the entry');
+  await p.waitForSelector('.journal-entry .photo-grid img');
+  ok(true, 'photo added to an existing entry');
+  // Photos straight from the new-entry form, with no text at all.
+  await p.setInputFiles('form[data-form=journal] input[name=photos]', [OUT + 'fake-pass.png', OUT + 'fake-pass.png']);
+  ok((await p.textContent('.jn-previews')).includes('2 photos'), 'chosen photos preview before saving');
+  await p.click('form[data-form=journal] button.primary');
+  await p.waitForFunction(() => document.querySelectorAll('.journal-entry').length === 2 && document.querySelectorAll('.journal-entry:last-of-type .photo-grid img').length === 2);
+  ok(true, 'photo-only entry saved with both photos');
+  ok(!!(await p.$('form[data-form=journal] input[name=camera][capture=environment]')), 'camera button opens the rear camera');
+  await p.click('.journal-entry .photo-grid a');
+  await p.waitForSelector('.viewer');
+  ok((await p.textContent('.v-title')).includes('Journal'), 'photo opens full screen');
+  await p.goto(at('2030-05-09T21:00', 'today'));
+  ok((await p.$$('.jn-strip img')).length >= 3, "Today's journal card shows the day's photos");
+  await shot(p, '09-journal');
 });
 
 await section('Server: live sharing between two phones, AI, Gmail', async () => {

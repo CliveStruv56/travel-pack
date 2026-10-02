@@ -539,3 +539,21 @@ input[type=date], input[type=time] { min-width: 0; -webkit-appearance: none; app
 .journal-new textarea { border: 0; padding: 4px; min-height: 90px; box-shadow: none !important; }
 .inbox-row .hint { margin: 0; }
 .bubble-text { white-space: pre-wrap; }
+
+/* journal photos */
+.photo-grid { display: grid; gap: 4px; margin: 0 0 10px; border-radius: 12px; overflow: hidden; }
+.photo-grid.n1 { grid-template-columns: 1fr; }
+.photo-grid.n2 { grid-template-columns: 1fr 1fr; }
+.photo-grid.n3 { grid-template-columns: 1fr 1fr 1fr; }
+.photo-grid a { display: block; aspect-ratio: 1; background: var(--surface-2); }
+.photo-grid.n1 a { aspect-ratio: 4 / 3; }
+.photo-grid img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.jn-actions { display: flex; gap: 8px; }
+.jn-actions .btn { flex: 1; padding: 0 10px; }
+.jn-actions .btn.primary { flex: 1.2; }
+.jn-previews { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.jn-previews:empty { display: none; }
+.jn-previews img { width: 56px; height: 56px; object-fit: cover; border-radius: 8px; }
+.jn-previews span { font-size: 13px; color: var(--muted); }
+.jn-strip { display: flex; gap: 4px; margin: 6px 0 2px; }
+.jn-strip img { width: 44px; height: 44px; object-fit: cover; border-radius: 8px; }

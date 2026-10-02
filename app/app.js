@@ -440,7 +440,7 @@ VIEWS.today = (t) => {
       const tm = days.find((d) => d.date === addDays(today, 1));
       return tm && tm.entries.some((e) => e.kind !== 'night') ? html`<h2 class="sec-h">Tomorrow · ${fmtDay(tm.date)}</h2>${tm.entries.filter((e) => e.kind !== 'night' && e.kind !== 'gap').slice(0, 3).map((e) => entryCard(e))}` : '';
     })() : ''}
-    ${!before && !t.readOnly ? html`<a class="card tip" href="#/journal/${after ? t.end : today}">${icon('edit')}<div><b>${after ? 'Trip journal' : "Today's journal"}</b><span>${journalCount(t, today) ? `${journalCount(t, today)} entr${journalCount(t, today) === 1 ? 'y' : 'ies'} today` : 'A few lines and photos to remember the day by.'}</span></div>${icon('right', 'sm dim')}</a>` : ''}
+    ${!before && !t.readOnly ? html`<a class="card tip" href="#/journal/${after ? t.end : today}">${icon('edit')}<div><b>${after ? 'Trip journal' : "Today's journal"}</b>${journalPhotos(t, today).length ? html`<span class="jn-strip">${journalPhotos(t, today).slice(0, 4).map((f) => html`<img src="${fileUrl(f)}" alt="">`)}</span>` : ''}<span>${journalCount(t, today) ? `${journalCount(t, today)} entr${journalCount(t, today) === 1 ? 'y' : 'ies'} today` : 'A few lines and photos to remember the day by.'}</span></div>${icon('right', 'sm dim')}</a>` : ''}
     ${!t.readOnly ? html`<button class="fab" data-act="new-item" data-date="${today >= t.start && today <= t.end ? today : ''}" aria-label="Add booking">${icon('plus')}</button>` : ''}
   </div>`;
 };
@@ -1159,6 +1159,11 @@ async function addDocFiles(docId, fileList) {
    Journal
    ===================================================================== */
 
+const journalPhotos = (t, date) => {
+  const ids = new Set((t?.journal || []).filter((j) => j.date === date).map((j) => j.id));
+  return S.files.filter((f) => ids.has(f.itemId));
+};
+
 const journalCount = (t, date) => (t?.journal || []).filter((j) => j.date === date).length;
 
 VIEWS.journal = (t, [date]) => {
@@ -1181,13 +1186,19 @@ VIEWS.journal = (t, [date]) => {
         <header><span class="avatar sm">${(j.author || '?').charAt(0).toUpperCase()}</span><b>${j.author || 'Me'}</b><small>${j.at ? hhmm(new Date(j.at)) : ''}</small>
           ${!ro ? html`<button class="icon-btn sm" data-act="journal-edit" data-id="${j.id}" aria-label="Edit entry">${icon('edit')}</button>` : ''}</header>
         ${j.text ? html`<p>${j.text}</p>` : ''}
-        ${photos.length || !ro ? html`<div class="thumbs">${photos.map((f) => thumb(f))}${!ro ? html`<button class="thumb add" data-act="add-files" data-item="${j.id}">${icon('image')}<span>Photos</span></button>` : ''}</div>` : ''}
+        ${photos.length ? html`<div class="photo-grid n${Math.min(photos.length, 3)}">${photos.map((f) => html`<a href="#/ticket/${f.id}"><img src="${fileUrl(f)}" alt="Journal photo" loading="lazy"></a>`)}</div>` : ''}
+        ${!ro ? html`<button class="mini" data-act="add-files" data-item="${j.id}">${icon('image', 'sm')} Add photos</button>` : ''}
       </article>`;
     })}
     ${!ro ? html`<form class="card journal-new" data-form="journal">
       <input type="hidden" name="date" value="${d}">
-      <textarea name="text" rows="4" placeholder="${entries.length ? 'Add more…' : 'What happened today? Where did you eat, who did you see?'}" required></textarea>
-      <button class="btn primary">${icon('plus')} Add entry</button>
+      <textarea name="text" rows="4" placeholder="${entries.length ? 'Add more…' : 'What happened today? Where did you eat, who did you see?'}"></textarea>
+      <div class="jn-previews" aria-live="polite"></div>
+      <div class="jn-actions">
+        <label class="btn">${icon('image')} Photos<input type="file" name="photos" accept="image/*" multiple hidden data-change="journal-photos"></label>
+        <label class="btn" aria-label="Take a photo">${icon('camera')} Camera<input type="file" name="camera" accept="image/*" capture="environment" hidden data-change="journal-photos"></label>
+        <button class="btn primary">${icon('plus')} Add</button>
+      </div>
     </form>` : ''}
     ${daysWith.length ? html`<h2 class="sec-h">Days with entries</h2><div class="chips">${daysWith.map((x) => html`<a class="chip-link ${x === d ? 'on' : ''}" href="#/journal/${x}" data-replace>${fmtDay(x)} · ${journalCount(t, x)}</a>`)}</div>` : ''}
     ${S.synced[t.id] ? html`<p class="hint">Shared live: entries and photos appear on Jane's phone too.</p>` : ''}
@@ -1558,11 +1569,11 @@ async function runExtract(path, body, source) {
 const fileToB64 = (blob) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = rej; r.readAsDataURL(blob); });
 
 /** Phone screenshots are large; the model reads a 1600px image just as well. */
-async function shrinkImage(blob) {
-  if (!blob.type.startsWith('image/') || blob.size < 600000) return blob;
+async function shrinkImage(blob, max = 1600, minBytes = 600000) {
+  if (!blob.type.startsWith('image/') || blob.size < minBytes) return blob;
   try {
     const bmp = await createImageBitmap(blob);
-    const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+    const scale = Math.min(1, max / Math.max(bmp.width, bmp.height));
     const c = document.createElement('canvas');
     c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
     c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
@@ -1755,16 +1766,19 @@ async function detectBarcode(blob) {
 
 async function addFiles(itemId, fileList) {
   const t = trip();
+  const photos = itemId.startsWith('j_');
   let found = 0;
   const existing = filesFor(itemId).length;
   let i = 0;
   for (const file of fileList) {
-    const blob = file.blob || file;
+    // Journal photos are kept at 2048px: plenty for a phone screen, and a
+    // fraction of the size to store, back up and share with Jane.
+    const blob = photos ? await shrinkImage(file.blob || file, 2048, 1200000) : file.blob || file;
     const rec = {
       id: uid('f_'), tripId: t.id, itemId, name: file.name || 'ticket', type: blob.type || file.type,
       size: blob.size, blob, createdAt: new Date().toISOString(), order: existing + i++,
     };
-    rec.barcode = await detectBarcode(blob);
+    rec.barcode = photos ? null : await detectBarcode(blob);
     if (rec.barcode) found++;
     await db.put('files', rec);
     S.files.push(rec);
@@ -1773,7 +1787,8 @@ async function addFiles(itemId, fileList) {
   if (S.synced[t.id]) scheduleSync(t.id);
   render();
   const n = fileList.length;
-  toast(`${n} ticket${n === 1 ? '' : 's'} added${found ? ` · ${found} barcode${found === 1 ? '' : 's'} found` : ''}`);
+  const noun = photos ? 'photo' : 'ticket';
+  toast(`${n} ${noun}${n === 1 ? '' : 's'} added${found ? ` · ${found} barcode${found === 1 ? '' : 's'} found` : ''}`);
 }
 
 fileInput.addEventListener('change', async () => {
@@ -1939,7 +1954,11 @@ const ACT = {
     });
   },
   'pick-type': (el) => { closeSheet(); S.draft = null; go(`new/${el.dataset.type}${el.dataset.date ? '/' + el.dataset.date : ''}`); },
-  'add-files': (el) => { pendingItem = el.dataset.item; fileInput.click(); },
+  'add-files': (el) => {
+    pendingItem = el.dataset.item;
+    fileInput.accept = pendingItem.startsWith('j_') ? 'image/*' : 'image/*,application/pdf';
+    fileInput.click();
+  },
   async 'del-item'(el) {
     const t = trip();
     const it = t.items.find((i) => i.id === el.dataset.item);
@@ -2307,6 +2326,14 @@ const FORMS = {
 };
 
 const CHANGE = {
+  'journal-photos'(el) {
+    const form = el.closest('form');
+    const box = form.querySelector('.jn-previews');
+    for (const u of box.querySelectorAll('img')) URL.revokeObjectURL(u.src);
+    const files = [...form.querySelectorAll('input[type=file]')].flatMap((i) => [...i.files]);
+    box.innerHTML = files.map((f) => `<img src="${URL.createObjectURL(f)}" alt="">`).join('');
+    if (files.length) box.insertAdjacentHTML('beforeend', `<span>${files.length} photo${files.length === 1 ? '' : 's'}</span>`);
+  },
   type(el) {
     const form = el.closest('form');
     S.draft = readItemForm(form, S.draft);
@@ -2598,10 +2625,13 @@ Object.assign(FORMS, {
   async journal(fd) {
     const t = trip();
     const text = String(fd.get('text') || '').trim();
-    if (!text) return;
+    const photos = [...fd.getAll('photos'), ...fd.getAll('camera')].filter((f) => f && f.size && f.type.startsWith('image/'));
+    if (!text && !photos.length) { toast('Write something or add a photo first.'); return; }
     t.journal = t.journal || [];
-    t.journal.push({ id: uid('j_'), date: String(fd.get('date')), text, author: S.me || getServer()?.name || '', at: new Date().toISOString() });
+    const entry = { id: uid('j_'), date: String(fd.get('date')), text, author: S.me || getServer()?.name || '', at: new Date().toISOString() };
+    t.journal.push(entry);
     await saveTrip(t);
+    if (photos.length) await addFiles(entry.id, photos);
   },
   'email-search': (fd) => emailSearch(String(fd.get('q') || '').trim()),
   ask(fd, form) {
