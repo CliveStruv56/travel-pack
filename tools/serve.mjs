@@ -16,7 +16,7 @@ const TYPES = {
   '.json': 'application/json', '.webmanifest': 'application/manifest+json', '.png': 'image/png', '.svg': 'image/svg+xml',
 };
 
-export function start(port = PORT, host = HOST) {
+export function start(port = PORT, host = HOST, { build = BUILD } = {}) {
   const server = createServer(async (req, res) => {
     try {
       let path = decodeURIComponent(new URL(req.url, 'http://x').pathname);
@@ -25,7 +25,7 @@ export function start(port = PORT, host = HOST) {
       if (!file.startsWith(ROOT)) { res.writeHead(403).end(); return; }
       if (!(await stat(file)).isFile()) throw new Error('not a file');
       let body = await readFile(file);
-      if (path.endsWith('/sw.js')) body = body.toString().replace('__BUILD__', BUILD);
+      if (path.endsWith('/sw.js')) body = body.toString().replaceAll('__BUILD__', build);
       res.writeHead(200, { 'Content-Type': TYPES[extname(file)] || 'application/octet-stream', 'Cache-Control': 'no-cache' });
       res.end(body);
     } catch {

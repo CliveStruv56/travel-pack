@@ -485,6 +485,38 @@ await section('Offline', async () => {
   await ctx.setOffline(false);
 });
 
+await section('A new version reaches an installed phone', async () => {
+  const port = 5198;
+  const url = `http://localhost:${port}/?now=2030-05-08T12:00#/more`;
+  let srv = await start(port, 'localhost', { build: 'one' });
+  const { ctx: c5, page: u } = await phone();
+  await u.goto(url);
+  await u.waitForFunction(() => navigator.serviceWorker.controller);
+  await u.reload();
+  await u.waitForSelector('.about');
+  ok((await u.textContent('.about')).includes('build one'), 'first version installed');
+  srv.close();
+  // Publish a new build, then the user simply opens the app again.
+  srv = await start(port, 'localhost', { build: 'two' });
+  await u.goto(url);
+  await u.waitForFunction(() => document.querySelector('.about')?.textContent.includes('build two'), null, { timeout: 15000 });
+  ok(true, 'reopening the app switches to the new version by itself');
+  await u.waitForTimeout(3000);
+  ok((await u.textContent('.about')).includes('build two'), 'and stays on it');
+  // An update that lands while the app is in use offers a Reload instead.
+  srv.close();
+  srv = await start(port, 'localhost', { build: 'three' });
+  await u.waitForTimeout(21000);
+  await u.evaluate(async () => (await navigator.serviceWorker.getRegistration()).update());
+  await u.waitForSelector('#toast.show button', { timeout: 15000 });
+  ok((await u.textContent('#toast')).includes('new version'), 'mid-use update offers Reload');
+  await u.click('#toast button');
+  await u.waitForFunction(() => document.querySelector('.about')?.textContent.includes('build three'), null, { timeout: 15000 });
+  ok(true, 'Reload switches to it');
+  srv.close();
+  await c5.close();
+});
+
 ok(errors.length === 0, `no page errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
 await browser.close();
 server.close();

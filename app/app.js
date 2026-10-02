@@ -848,7 +848,7 @@ VIEWS.more = (t) => {
     </div>
     <div class="about">
       <p>${icon(S.persisted ? 'lock' : 'info', 'sm')} ${S.persisted ? 'Storage is protected. Android will not clear it to free space.' : 'Everything is stored on this phone only.'}</p>
-      <p>Travel Pack ${APP_VERSION} · works offline</p>
+      <p>Travel Pack ${APP_VERSION}${S.build ? ` · build ${S.build}` : ''} · works offline</p>
     </div>
   </div>`;
 };
@@ -2398,16 +2398,31 @@ window.addEventListener('beforeinstallprompt', (e) => { e.preventDefault(); S.in
 window.addEventListener('hashchange', () => { S.cameFromApp = true; onRoute(); });
 
 if ('serviceWorker' in navigator && location.protocol !== 'file:') {
+  // A new version installs in the background and then waits. If that happens
+  // while the app is just opening (nothing typed yet), switch to it at once;
+  // otherwise offer a Reload. Checking happens on open, on return to the app
+  // and hourly, so an update never sits unnoticed.
+  const opening = () => performance.now() < 20000 && !S.draft && !sheetRoot.classList.contains('open');
+  const ready = (w) => {
+    if (!navigator.serviceWorker.controller || S.updateReady === w) return;
+    S.updateReady = w;
+    if (opening()) { w.postMessage('skipWaiting'); return; }
+    toast('A new version is ready', { act: 'apply-update', label: 'Reload' });
+    if (S.route.name === 'more') render();
+  };
+  const watch = (w) => {
+    if (!w) return;
+    if (w.state === 'installed') return ready(w);
+    w.addEventListener('statechange', () => { if (w.state === 'installed') ready(w); });
+  };
   navigator.serviceWorker.register('./sw.js').then((reg) => {
-    const watch = (w) => w && w.addEventListener('statechange', () => {
-      if (w.state === 'installed' && navigator.serviceWorker.controller) {
-        S.updateReady = w;
-        toast('A new version is ready', { act: 'apply-update', label: 'Reload' });
-      }
-    });
-    if (reg.waiting && navigator.serviceWorker.controller) { S.updateReady = reg.waiting; }
+    if (reg.waiting) ready(reg.waiting);
+    watch(reg.installing);
     reg.addEventListener('updatefound', () => watch(reg.installing));
-    setInterval(() => reg.update().catch(() => {}), 6 * 3600000);
+    let lastCheck = Date.now();
+    const check = () => { if (Date.now() - lastCheck > 60000) { lastCheck = Date.now(); reg.update().catch(() => {}); } };
+    document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') check(); });
+    setInterval(() => reg.update().catch(() => {}), 3600000);
   }).catch(() => {});
   let reloading = false;
   navigator.serviceWorker.addEventListener('controllerchange', () => { if (!reloading && S.updateReady) { reloading = true; location.reload(); } });
@@ -2663,6 +2678,7 @@ document.addEventListener('visibilitychange', () => {
 (async function boot() {
   try {
     await loadAll();
+    try { S.build = ((await caches.keys()).find((k) => k.startsWith('tp-')) || '').replace(/^tp-/, ''); } catch { /* no cache API */ }
     S.account = (await db.get('meta', 'account')) || null;
     if (navigator.storage?.persisted) S.persisted = await navigator.storage.persisted();
     await refreshInbox();
