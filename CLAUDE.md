@@ -13,7 +13,8 @@ bookings and ticket barcodes on an Android phone. See README.md for features and
 - **No real trip data in git.** The repo is public, and trip files hold booking references. Real trips live in
   `trips/` (git-ignored). Tests use the fictional `tests/fixtures/sample.travelpack.json` (8–20 May 2030).
   Never copy real references, names or phone numbers into fixtures, tests, docs or commit messages.
-- **It must work offline.** Nothing in `app/` may load from another origin (no CDNs, fonts or analytics).
+- **It must work offline.** Nothing in `app/` may load code or styles from another origin (no CDNs, fonts or analytics).
+  The only network calls are data: the user's own server (`api.js`) and Open-Meteo weather (`weather.js`), both cached or optional.
   Every file in `app/` must be listed in `ASSETS` in `app/sw.js`, or it will be missing offline.
   `npm run check` enforces both.
 - **Leave `VERSION = 'tp-__BUILD__'` alone** in `app/sw.js`. Deploy replaces it with the commit id.
@@ -28,4 +29,11 @@ bookings and ticket barcodes on an Android phone. See README.md for features and
   it would wipe their people, ticked to-dos and edits.
 - Headless Linux Chromium has no `BarcodeDetector`, so tests fake the detected box. Barcode detection itself
   can only be verified on an Android phone.
+- **Server (`server/`)**: see docs-server.md. Keep these rules:
+  - `app/merge.js` is shared by the phone and the server. Every record carries `updatedAt`, set by `stampChanges` on save
+    (never by hand), and deletions are tombstones in `trip.deleted`. Don't add collections without adding them to `COLLECTIONS`.
+  - **AI output is never applied without a tap.** Extraction goes to a review screen; chat changes need Apply. Tests assert this.
+  - The model is `claude-opus-5-5`, called through the official SDK with structured outputs and `fallbacks: "default"`.
+    `server/sdk.test.mjs` checks the real SDK's wire format in CI.
+  - Documents (`tripId: '__docs'`) are personal and never synced. Secrets live only in server environment variables.
 - Deploy is `.github/workflows/ci.yml`: tests on every push and PR, then GitHub Pages from `main`.

@@ -5,7 +5,7 @@
 const VERSION = 'tp-__BUILD__';
 const ASSETS = [
   './', './index.html', './styles.css', './app.js', './util.js', './db.js', './model.js',
-  './icons.js', './ics.js', './share.js', './manifest.webmanifest',
+  './icons.js', './ics.js', './share.js', './api.js', './merge.js', './weather.js', './manifest.webmanifest',
   './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png',
 ];
 
@@ -36,10 +36,13 @@ function inboxDb() {
 async function receiveShare(request) {
   const form = await request.formData();
   const files = form.getAll('files').filter((f) => f && f.size);
+  const text = [form.get('text'), form.get('url')].filter(Boolean).join('\n').trim();
+  const title = String(form.get('title') || '').trim();
   const db = await inboxDb();
   await new Promise((resolve, reject) => {
     const tx = db.transaction('inbox', 'readwrite');
     const s = tx.objectStore('inbox');
+    if (text) s.put({ id: 'in_' + Date.now().toString(36) + 't', name: title || 'Shared text', text, at: Date.now() });
     for (const f of files) {
       s.put({ id: 'in_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7), name: f.name || 'shared file', type: f.type, blob: f, at: Date.now() });
     }

@@ -24,6 +24,8 @@ jobs:
       - run: npm install --no-audit --no-fund
       - run: npx playwright install --with-deps chromium
       - run: npm run check
+      - run: npm ls @anthropic-ai/sdk
+      - run: npm run test:server
       - run: SHOTS=1 node tests/e2e.mjs
       - uses: actions/upload-artifact@v4
         if: always()

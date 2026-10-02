@@ -7,8 +7,11 @@ import {
 } from './model.js';
 import { tripToIcs, googleCalendarUrl } from './ics.js';
 import { shareLink, readShareLink, readAddLink, shareText, exportBundle, parseBundle } from './share.js';
+import { api, loadServer, getServer, setServer, readConnectLink } from './api.js';
+import { stampChanges, tombstone, mergeTrips, forServer, sameContent } from './merge.js';
+import { geocode, forecast, daily, hourly, legRisk, isWeatherSensitive, describeCode } from './weather.js';
 
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '2.0.0';
 
 /* =====================================================================
    State
@@ -30,6 +33,19 @@ const S = {
   installPrompt: null,
   updateReady: null,
   showWhole: false,     // ticket viewer: whole image vs barcode crop
+  snap: new Map(),      // last saved copy of each trip, to work out what changed
+  synced: {},           // tripId → { rev, at } for trips shared live through the server
+  sync: { state: 'idle', error: '' },
+  account: null,        // what the server says about this phone's user (/api/me)
+  incomingConnect: null,
+  weather: {},          // place name → { geo, data }
+  chat: {},             // tripId → [{ role, content, changes }]
+  chatBusy: false,
+  docs: [],             // personal documents (passport, insurance…), never synced
+  docFiles: [],
+  ai: null,             // last AI extraction, waiting for review
+  aiBusy: '',
+  email: { q: '', results: null, msg: null, busy: false, error: '' },
 };
 
 const qs = new URLSearchParams(location.search);
@@ -66,6 +82,10 @@ async function loadAll() {
   S.tripId = (await db.get('meta', 'currentTrip')) || null;
   S.me = (await db.get('meta', 'me')) || '';
   S.lastBackup = (await db.get('meta', 'lastBackup')) || null;
+  S.synced = (await db.get('meta', 'synced')) || {};
+  S.docs = (await db.get('meta', 'docs')) || [];
+  for (const t of S.trips) S.snap.set(t.id, structuredClone(t));
+  await loadServer();
   if (!S.trips.find((t) => t.id === S.tripId)) S.tripId = pickDefaultTrip()?.id || null;
   await loadFiles();
 }
@@ -86,14 +106,23 @@ async function loadFiles() {
 }
 
 async function saveTrip(t, { quiet } = {}) {
+  // Stamp what changed since the last save, so two phones can merge edits.
+  stampChanges(S.snap.get(t.id), t);
   t.updatedAt = new Date().toISOString();
+  await storeTrip(t);
+  if (S.synced[t.id]) scheduleSync(t.id);
+  if (!quiet) render();
+}
+
+/** Write a trip as-is (used for saves and for copies arriving from the server). */
+async function storeTrip(t) {
   await db.put('trips', t);
+  S.snap.set(t.id, structuredClone(t));
   const i = S.trips.findIndex((x) => x.id === t.id);
   if (i >= 0) S.trips[i] = t;
   else S.trips.push(t);
   S.trips.sort((a, b) => (a.start || '').localeCompare(b.start || ''));
   askPersist();
-  if (!quiet) render();
 }
 
 async function setCurrentTrip(id) {
@@ -111,10 +140,10 @@ async function askPersist() {
    Routing
    ===================================================================== */
 
-const TABS = ['today', 'plan', 'tickets', 'todo', 'more'];
+const TABS = ['today', 'plan', 'tickets', 'docs', 'todo', 'more'];
 
 function parseRoute() {
-  const h = location.hash.replace(/^#\/?/, '');
+  const h = location.hash.replace(/^#\/?/, '').split('?')[0];
   const parts = h.split('/').filter(Boolean).map(decodeURIComponent);
   return { name: parts[0] || 'today', parts: parts.slice(1) };
 }
@@ -131,6 +160,15 @@ async function onRoute() {
       history.replaceState(null, '', '#/today');
     }
   }
+  if (location.hash.startsWith('#connect=')) {
+    try {
+      S.incomingConnect = readConnectLink(location.hash.slice(1));
+      history.replaceState(null, '', '#/connect');
+    } catch {
+      toast('That connect link could not be read.');
+      history.replaceState(null, '', '#/today');
+    }
+  }
   if (location.hash.startsWith('#add=')) {
     try {
       S.incoming = await readAddLink(location.hash.slice(1));
@@ -144,7 +182,12 @@ async function onRoute() {
   S.route = parseRoute();
   if (S.route.name === 'add' && !S.incoming) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
   if (S.route.name === 'shared' && !S.preview) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
+  if (S.route.name === 'sync') { S.serverTrips = null; loadServerTrips(); }
+  if (S.route.name === 'connect' && !S.incomingConnect) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
   if (S.route.name === 'inbox') await refreshInbox();
+  if (S.route.name === 'email' && /gmail=connected/.test(location.hash)) { toast('Gmail connected'); refreshAccount(); }
+  if (S.route.name === 'email' && /gmail=error/.test(location.hash)) toast('Gmail was not connected. Try again.');
+  if (['docs', 'doc'].includes(S.route.name) || (S.route.name === 'ticket' && S.route.parts[0]?.startsWith('d'))) await loadDocFiles();
   if (S.route.name !== 'edit' && S.route.name !== 'new') S.draft = null;
   if (S.route.name !== 'ticket') releaseWakeLock();
   closeSheet();
@@ -189,7 +232,7 @@ function render() {
 /** Things innerHTML can't do: draw barcode crops. */
 function hydrate() {
   document.querySelectorAll('canvas[data-crop]').forEach((c) => {
-    const f = S.files.find((x) => x.id === c.dataset.crop) || S.inboxFiles?.find((x) => x.id === c.dataset.crop);
+    const f = anyFile(c.dataset.crop);
     if (f) drawCrop(c, f);
   });
 }
@@ -198,11 +241,12 @@ function navBar() {
   const t = trip();
   const badge = t && !t.readOnly ? (t.checklist || []).filter((c) => !c.done).length + toBook(t).length : 0;
   const tabs = [
-    ['today', 'sun', 'Today'], ['plan', 'calendar', 'Plan'], ['tickets', 'ticket', 'Tickets'],
+    ['today', 'sun', 'Today'], ['plan', 'calendar', 'Plan'], ['tickets', 'wallet', 'Wallet'],
     ['todo', 'checklist', 'To-do'], ['more', 'menu', 'More'],
   ];
+  const on = (k) => S.route.name === k || (k === 'tickets' && S.route.name === 'docs');
   return html`<nav class="nav" aria-label="Main">${tabs.map(([k, ic, label]) => html`
-    <a href="#/${k}" class="${S.route.name === k ? 'on' : ''}" ${S.route.name === k ? raw('aria-current="page"') : ''}>
+    <a href="#/${k}" class="${on(k) ? 'on' : ''}" ${on(k) ? raw('aria-current="page"') : ''}>
       <span class="nav-ic">${icon(ic)}${k === 'todo' && badge ? html`<b class="badge">${badge}</b>` : ''}</span>${label}</a>`)}</nav>`;
 }
 
@@ -212,8 +256,16 @@ function topBar(t) {
       <span class="top-name">${t ? t.name : 'Travel Pack'}</span>
       ${t ? html`<span class="top-dates">${fmtRange(t.start, t.end)} ${icon('down', 'sm')}</span>` : ''}
     </a>
-    ${netPill()}
+    ${netPill()}${syncPill(t)}
+    ${getServer() && S.account?.ai && t && !t.readOnly ? html`<a class="icon-btn ask-btn" href="#/ask" aria-label="Ask Travel Pack">${icon('sparkle')}</a>` : ''}
   </header>`;
+}
+
+function syncPill(t) {
+  if (!t || !S.synced[t.id]) return '';
+  const st = S.sync.state;
+  const label = st === 'busy' ? 'Syncing' : st === 'error' ? 'Not synced' : 'Shared';
+  return html`<a class="pill sync ${st}" href="#/sync" title="${S.sync.error || 'Shared live through your server'}">${icon(st === 'error' ? 'alert' : 'refresh', 'sm')} ${label}</a>`;
 }
 
 const netPill = () => (S.online ? '' : html`<span class="pill offline" title="Everything is saved on this phone">${icon('offline', 'sm')} Offline</span>`);
@@ -297,6 +349,7 @@ function entryCard(e, opts = {}) {
       <div class="end-b"><b class="time">${it.endTime || '––:––'}${nextDay ? html`<sup>+1</sup>` : ''}</b><span class="place">${it.to || '—'}</span></div>
     </div>
     ${!it.time && it.status !== 'cancelled' ? html`<div class="entry-note">${it.status === 'tobook' ? 'Service and time to choose' : 'Time to confirm'}</div>` : ''}
+    ${riskBadge(it)}
     <div class="meta">
       ${it.seat ? html`<span class="meta-i">${it.type === 'train' ? 'Seat' : it.type === 'ferry' ? 'Cabin' : 'Seat'} ${it.seat}</span>` : ''}
       ${it.ref ? html`<span class="meta-i mono">${it.ref}</span>` : ''}
@@ -310,8 +363,12 @@ function dayBlock(day, t) {
   const isToday = day.date === today;
   return html`<section class="day ${isToday ? 'is-today' : ''} ${day.date < today ? 'past' : ''}" id="day-${day.date}">
     <h2 class="day-h"><span>${fmtLongDay(day.date)}</span>
-      <span class="day-no">${isToday ? html`<b class="today-tag">Today</b>` : ''}${dayNo > 0 ? `Day ${dayNo}` : ''}</span></h2>
+      <span class="day-no">${dayWeatherChip(t, day.date)}${isToday ? html`<b class="today-tag">Today</b>` : ''}${dayNo > 0 ? `Day ${dayNo}` : ''}</span></h2>
     ${day.entries.length ? day.entries.map((e) => entryCard(e)) : html`<div class="slim quiet">${icon('sun', 'sm')}<span>Nothing planned</span></div>`}
+    ${isPreview() ? '' : html`<div class="day-tools">
+      ${!readOnly() ? html`<button class="mini" data-act="new-item" data-date="${day.date}">${icon('plus', 'sm')} Add</button>` : ''}
+      ${!t.readOnly ? html`<a class="mini" href="#/journal/${day.date}">${icon('edit', 'sm')} Journal${journalCount(t, day.date) ? ` · ${journalCount(t, day.date)}` : ''}</a>` : ''}
+    </div>`}
   </section>`;
 }
 
@@ -344,6 +401,7 @@ VIEWS.today = (t) => {
     return html`<section class="hero-wrap">
       <div class="hero-label">${label} <span class="due" data-due="${at.getTime()}">${fmtUntil(at, n)}</span></div>
       ${entryCard(isStay(it) ? { kind: m.end ? 'checkout' : 'checkin', item: it, nights: daysBetween(it.date, it.endDate || it.date) } : { kind: 'item', item: it }, { hero: true })}
+      ${riskBanner(it)}
       ${keyTimes(it, true)}
       <div class="hero-actions">
         ${all.length ? html`<a class="btn primary" href="#/ticket/${all[0].id}">${icon('scan')} Show ticket</a>` : ''}
@@ -382,6 +440,8 @@ VIEWS.today = (t) => {
       const tm = days.find((d) => d.date === addDays(today, 1));
       return tm && tm.entries.some((e) => e.kind !== 'night') ? html`<h2 class="sec-h">Tomorrow · ${fmtDay(tm.date)}</h2>${tm.entries.filter((e) => e.kind !== 'night' && e.kind !== 'gap').slice(0, 3).map((e) => entryCard(e))}` : '';
     })() : ''}
+    ${!before && !t.readOnly ? html`<a class="card tip" href="#/journal/${after ? t.end : today}">${icon('edit')}<div><b>${after ? 'Trip journal' : "Today's journal"}</b><span>${journalCount(t, today) ? `${journalCount(t, today)} entr${journalCount(t, today) === 1 ? 'y' : 'ies'} today` : 'A few lines and photos to remember the day by.'}</span></div>${icon('right', 'sm dim')}</a>` : ''}
+    ${!t.readOnly ? html`<button class="fab" data-act="new-item" data-date="${today >= t.start && today <= t.end ? today : ''}" aria-label="Add booking">${icon('plus')}</button>` : ''}
   </div>`;
 };
 
@@ -469,8 +529,12 @@ VIEWS.item = (t, [id]) => {
     <div class="d-head">
       <span class="tile lg">${icon(T.icon)}</span>
       <div><h2>${itemTitle(it)}</h2>${itemSubtitle(it) ? html`<p>${itemSubtitle(it)}</p>` : ''}</div>
-      ${chip(it.status)}
+      ${ro ? chip(it.status) : html`<button class="chip-btn" data-act="status-sheet" data-item="${it.id}" aria-label="Change status">${chip(it.status)}${icon('down', 'sm')}</button>`}
     </div>
+    ${!ro ? html`<div class="d-quick">
+      <a class="btn primary" href="#/edit/${it.id}">${icon('edit')} Edit booking</a>
+      ${(tk.own.length || tk.related.length) ? html`<a class="btn" href="#/ticket/${[...tk.own, ...tk.related][0].id}">${icon('scan')} Ticket</a>` : ''}
+    </div>` : ''}
 
     ${isTransport(it) ? html`<div class="card d-route">
       <div><small>${T.when[0]}</small><b class="time">${it.time || '––:––'}</b><span>${it.from || ''}</span><em>${fmtDay(it.date)}</em></div>
@@ -503,6 +567,8 @@ VIEWS.item = (t, [id]) => {
 
     ${it.keyTimes ? html`<h3 class="sec-h">Key times</h3>${keyTimes(it)}` : ''}
 
+    ${weatherSection(it)}
+
     ${people.length ? html`<h3 class="sec-h">People</h3><div class="card list-card">${people.map(personRow)}</div>` : ''}
 
     ${it.notes ? html`<h3 class="sec-h">Notes</h3><div class="card notes">${it.notes}</div>` : ''}
@@ -513,6 +579,7 @@ VIEWS.item = (t, [id]) => {
 
     ${!ro ? html`<div class="d-actions">
       ${S.online ? html`<a class="btn" href="${googleCalendarUrl(it)}" target="_blank" rel="noopener">${icon('calendar')} Add to Google Calendar</a>` : ''}
+      <a class="btn" href="#/edit/${it.id}">${icon('edit')} Edit booking</a>
       <button class="btn" data-act="dup-item" data-item="${it.id}">${icon('copy')} Duplicate</button>
       <button class="btn danger-ghost" data-act="del-item" data-item="${it.id}">${icon('trash')} Delete</button>
     </div>` : ''}
@@ -608,6 +675,10 @@ function editor(t, d, isNew) {
     ${t.people.length ? html`<fieldset><legend>People</legend><div class="checks">${t.people.map((p) => html`<label class="check"><input type="checkbox" name="people" value="${p.id}" ${(d.people || []).includes(p.id) ? raw('checked') : ''}><span>${p.name}</span></label>`)}</div></fieldset>` : ''}
     <p class="hint">${t.people.length ? '' : html`Add drivers and hosts under <a href="#/people">More → People</a> to link them here.`}</p>
 
+    ${isTransport(d) ? html`<fieldset><legend>Weather & Plan B</legend>
+      <label class="check"><input type="checkbox" name="weatherSensitive" ${isWeatherSensitive(d) ? raw('checked') : ''}><span>Warn me if weather could disrupt this leg</span></label>
+      <label class="fld" style="margin-top:10px"><span>Plan B <small>what to do if it's cancelled</small></span>
+      <textarea name="planB" rows="3" placeholder="e.g. Next flight is… / ferry alternative… / who to call">${d.planB || ''}</textarea></label></fieldset>` : ''}
     <label class="fld"><span>Notes</span><textarea name="notes" rows="4">${d.notes || ''}</textarea></label>
     <label class="fld"><span>Links <small>one per line: Label | https://…</small></span><textarea name="links" rows="2" placeholder="Manage booking | https://…">${d.links || ''}</textarea></label>
 
@@ -621,9 +692,10 @@ function editor(t, d, isNew) {
 function readItemForm(form, base) {
   const fd = new FormData(form);
   const d = { ...base };
-  for (const k of ['type', 'status', 'title', 'provider', 'number', 'from', 'to', 'fromCode', 'toCode', 'date', 'time', 'endDate', 'endTime', 'seat', 'class', 'ref', 'eticket', 'address', 'phone', 'keyTimes', 'notes', 'links']) {
+  for (const k of ['type', 'status', 'title', 'provider', 'number', 'from', 'to', 'fromCode', 'toCode', 'date', 'time', 'endDate', 'endTime', 'seat', 'class', 'ref', 'eticket', 'address', 'phone', 'keyTimes', 'notes', 'links', 'planB']) {
     if (fd.has(k)) d[k] = String(fd.get(k) || '').trim();
   }
+  if (form.querySelector('[name=weatherSensitive]')) d.weatherSensitive = fd.get('weatherSensitive') === 'on';
   if (fd.has('people')) d.people = fd.getAll('people').map(String);
   else if (form.querySelector('[name=people]')) d.people = [];
   const amt = String(fd.get('costAmount') || '').trim();
@@ -642,6 +714,7 @@ VIEWS.tickets = (t) => {
     && !(it.ref && t.items.some((o) => o.id !== it.id && o.ref === it.ref && filesFor(o.id).length)));
   const today = isoDate(now());
   return html`${topBar(t)}<div class="page">
+    ${walletTabs('tickets')}
     ${withFiles.length ? '' : html`<div class="card tip static">${icon('info')}<div><b>How to add tickets</b>
       <span>In the Loganair or Trainline app, open the boarding pass or ticket and take a screenshot. For emails (NorthLink, Premier Inn), open the attachment and screenshot the page with the barcode, or tap <b>Share → Travel Pack</b>. Then add it to the booking below. Barcodes are found automatically so they can be shown full-screen.</span></div></div>`}
     ${withFiles.map((it) => html`<section class="tk-group ${(it.endDate || it.date) < today ? 'past' : ''}">
@@ -658,8 +731,10 @@ VIEWS.tickets = (t) => {
 };
 
 VIEWS.ticket = (t, [fileId]) => {
-  const f = S.files.find((x) => x.id === fileId);
+  const f = anyFile(fileId);
   if (!f) return html`${subBar('Ticket', 'tickets')}<div class="page"><div class="empty"><p>Ticket not found.</p></div></div>`;
+  const ctx = fileContext(f, t);
+  if (ctx) return viewerFor(f, ctx);
   const it = t.items.find((i) => i.id === f.itemId);
   const siblings = it ? [...ticketsFor(it).own, ...ticketsFor(it).related] : [f];
   const pos = siblings.findIndex((x) => x.id === f.id);
@@ -750,6 +825,17 @@ VIEWS.more = (t) => {
       <button class="row" data-act="export-ics"><span class="row-ic">${icon('calendar')}</span><span class="row-main"><b>Add to calendar</b><small>Calendar file with reminders before each departure</small></span>${icon('download', 'sm dim')}</button>
       ${ro ? html`<button class="row" data-act="make-editable"><span class="row-ic">${icon('edit')}</span><span class="row-main"><b>Make an editable copy</b><small>Stops updating from share links</small></span></button>` : ''}
     </div>` : ''}
+    <h2 class="sec-h">Assistant, email & sharing</h2><div class="card list-card">
+      ${getServer() ? html`
+        ${S.account?.ai && t && !ro ? link('#/ask', 'sparkle', 'Ask Travel Pack', 'Questions about the trip, or changes in plain English') : ''}
+        ${S.account?.gmail?.available ? link('#/email', 'message', 'Search email', S.account.gmail.connected ? `Gmail · ${S.account.gmail.email || 'connected'}` : 'Connect Gmail to find bookings') : ''}
+        ${link('#/sync', 'refresh', 'Live sharing & server', t && S.synced[t.id] ? 'This trip is shared live' : `Connected as ${getServer().name}`)}`
+        : link('#/sync', 'refresh', 'Live sharing, AI & email', 'Connect this phone to your Travel Pack server')}
+    </div>
+    <h2 class="sec-h">Keepsakes & papers</h2><div class="card list-card">
+      ${t && !ro ? link(`#/journal/${isoDate(now()) >= t.start && isoDate(now()) <= t.end ? isoDate(now()) : t.start}`, 'edit', 'Journal', `${(t.journal || []).length} entr${(t.journal || []).length === 1 ? 'y' : 'ies'}`) : ''}
+      ${link('#/docs', 'file', 'Documents', S.docs.length ? `${S.docs.length} saved · passport, insurance, cards` : 'Passport, insurance, railcard…')}
+    </div>
     <h2 class="sec-h">Trips</h2><div class="card list-card">
       ${link('#/trips', 'suitcase', 'All trips', `${S.trips.length} on this phone`)}
       <button class="row" data-act="new-trip"><span class="row-ic">${icon('plus')}</span><span class="row-main"><b>New trip</b></span></button>
@@ -890,11 +976,13 @@ VIEWS.inbox = (t) => {
     ${!S.inbox.length ? html`<div class="empty"><p>Nothing waiting.</p></div>` : html`
     <p class="lead">Choose which booking ${S.inbox.length === 1 ? 'this file belongs' : 'these files belong'} to.</p>
     ${S.inbox.map((f) => html`<div class="card inbox-row">
-      ${f.type?.startsWith('image/') ? html`<img src="${inboxUrl(f)}" alt="">` : html`<span class="thumb-file">${icon('file')}</span>`}
+      ${f.text ? html`<span class="thumb-file">${icon('message')}</span>` : f.type?.startsWith('image/') ? html`<img src="${inboxUrl(f)}" alt="">` : html`<span class="thumb-file">${icon('file')}</span>`}
       <div class="inbox-main"><b>${f.name}</b>
-        <select data-inbox="${f.id}" aria-label="Booking">${items.map((it) => html`<option value="${it.id}">${fmtDay(it.date)} · ${itemTitle(it)}</option>`)}</select>
-        <div class="row-btns"><button class="btn primary xs" data-act="inbox-attach" data-id="${f.id}">Attach</button>
-        <button class="btn ghost xs" data-act="inbox-discard" data-id="${f.id}">Discard</button></div></div>
+        ${f.text ? html`<p class="hint clamp">${f.text}</p>` : html`<select data-inbox="${f.id}" aria-label="Booking">${items.map((it) => html`<option value="${it.id}">${fmtDay(it.date)} · ${itemTitle(it)}</option>`)}</select>`}
+        <div class="row-btns">
+          ${!f.text ? html`<button class="btn primary xs" data-act="inbox-attach" data-id="${f.id}">Attach</button>` : ''}
+          ${getServer() && S.account?.ai ? html`<button class="btn xs" data-act="inbox-ai" data-id="${f.id}">${icon('sparkle', 'sm')} Read with AI</button>` : ''}
+          <button class="btn ghost xs" data-act="inbox-discard" data-id="${f.id}">Discard</button></div></div>
     </div>`)}`}
   </div>`;
 };
@@ -906,6 +994,694 @@ function inboxUrl(f) {
 }
 async function refreshInbox() {
   try { S.inbox = (await takeInbox()).rows; } catch { S.inbox = []; }
+}
+
+/* =====================================================================
+   Documents
+   ===================================================================== */
+
+const DOCS = '__docs';
+
+const DOC_CATS = {
+  passport: { label: 'Passport & ID', icon: 'lock' },
+  licence: { label: 'Driving licence', icon: 'car' },
+  insurance: { label: 'Travel insurance', icon: 'info' },
+  health: { label: 'Health & medical', icon: 'alert' },
+  railcard: { label: 'Railcards & passes', icon: 'train' },
+  cards: { label: 'Cards & memberships', icon: 'wallet' },
+  other: { label: 'Other', icon: 'file' },
+};
+
+function anyFile(id) {
+  return S.files.find((f) => f.id === id) || S.docFiles.find((f) => f.id === id) || null;
+}
+
+/** Where a non-ticket file belongs (a document or a journal entry), for the viewer. */
+function fileContext(f, t) {
+  if (f.tripId === DOCS) {
+    const d = S.docs.find((x) => x.id === f.itemId);
+    return {
+      title: d?.title || 'Document', sub: d ? (DOC_CATS[d.category] || DOC_CATS.other).label : '', back: d ? `#/doc/${d.id}` : '#/docs',
+      siblings: S.docFiles.filter((x) => x.itemId === f.itemId), facts: d ? [['Number', d.number], ['Expires', d.expiry ? fmtDay(d.expiry) : '']] : [],
+    };
+  }
+  if (f.itemId?.startsWith('j_') && t) {
+    const j = (t.journal || []).find((x) => x.id === f.itemId);
+    return { title: 'Journal', sub: j ? fmtLongDay(j.date) : '', back: j ? `#/journal/${j.date}` : '#/plan', siblings: S.files.filter((x) => x.itemId === f.itemId), facts: [] };
+  }
+  return null;
+}
+
+function viewerFor(f, ctx) {
+  const pos = ctx.siblings.findIndex((x) => x.id === f.id);
+  const prev = ctx.siblings[pos - 1], next = ctx.siblings[pos + 1];
+  const img = f.type?.startsWith('image/');
+  const crop = f.barcode && !S.showWhole;
+  const facts = ctx.facts.filter(([, v]) => v);
+  return html`<div class="viewer">
+    <header class="v-top"><a class="icon-btn" href="${ctx.back}" aria-label="Close">${icon('x')}</a>
+      <div class="v-title"><b>${ctx.title}</b><small>${ctx.sub}${ctx.siblings.length > 1 ? ` · ${pos + 1} of ${ctx.siblings.length}` : ''}</small></div>
+      ${!readOnly() ? html`<button class="icon-btn" data-act="del-file" data-file="${f.id}" aria-label="Delete">${icon('trash')}</button>` : ''}</header>
+    <div class="v-body ${crop ? 'crop' : ''}" data-act="toggle-crop">
+      ${img ? (crop ? html`<canvas data-crop="${f.id}" aria-label="Barcode"></canvas>` : html`<img src="${fileUrl(f)}" alt="">`)
+        : html`<div class="v-pdf">${icon('file')}<p><b>${f.name}</b></p><button class="btn primary" data-act="open-file" data-file="${f.id}">${icon('external')} Open</button></div>`}
+    </div>
+    <footer class="v-foot">
+      ${facts.length ? html`<div class="v-facts">${facts.map(([k, v]) => html`<div><small>${k}</small><b>${v}</b></div>`)}</div>` : ''}
+      ${f.barcode && img ? html`<button class="btn xs ghost" data-act="toggle-crop">${S.showWhole ? 'Show barcode only' : 'Show whole image'}</button>` : ''}
+      <div class="v-nav">
+        ${prev ? html`<a class="btn ghost" href="#/ticket/${prev.id}" data-replace>${icon('left')} Prev</a>` : html`<span></span>`}
+        ${next ? html`<a class="btn ghost" href="#/ticket/${next.id}" data-replace>Next ${icon('right')}</a>` : html`<span></span>`}
+      </div>
+    </footer>
+  </div>`;
+}
+
+async function loadDocFiles() {
+  S.docFiles = await db.byIndex('files', 'tripId', DOCS);
+}
+
+async function saveDocs() {
+  await db.put('meta', S.docs, 'docs');
+}
+
+function walletTabs(on) {
+  return html`<div class="seg-tabs" role="tablist">
+    <a href="#/tickets" role="tab" class="${on === 'tickets' ? 'on' : ''}">${icon('ticket', 'sm')} Tickets</a>
+    <a href="#/docs" role="tab" class="${on === 'docs' ? 'on' : ''}">${icon('file', 'sm')} Documents</a></div>`;
+}
+
+function expiryNote(d, t) {
+  if (!d.expiry) return null;
+  const today = isoDate(now());
+  if (d.expiry < today) return { cls: 'bad', text: `Expired ${fmtDay(d.expiry)}` };
+  const months = daysBetween(today, d.expiry) / 30.4;
+  const tripEnd = t?.end || today;
+  if (d.expiry < tripEnd) return { cls: 'bad', text: `Expires during the trip (${fmtDay(d.expiry)})` };
+  if (months < 6) return { cls: 'warn', text: `Expires ${fmtDay(d.expiry)}` };
+  return { cls: '', text: `Expires ${new Date(d.expiry).toLocaleDateString('en-GB', { month: 'short', year: 'numeric' })}` };
+}
+
+VIEWS.docs = (t) => {
+  const groups = Object.entries(DOC_CATS).map(([k, c]) => [k, c, S.docs.filter((d) => (d.category || 'other') === k)]).filter(([, , list]) => list.length);
+  return html`${topBar(t)}<div class="page">
+    ${walletTabs('docs')}
+    ${!S.docs.length ? html`<div class="card tip static">${icon('lock')}<div><b>Your travel papers, offline</b>
+      <span>Passport, insurance policy and helpline, railcard, prescriptions. Add the number and a photo of each. Documents stay on this phone and in your backups; they are never shared with anyone, including through live sharing.</span></div></div>` : ''}
+    ${groups.map(([k, c, list]) => html`<h2 class="sec-h">${c.label}</h2><div class="card list-card">${list.map((d) => {
+      const ex = expiryNote(d, t);
+      const n = S.docFiles.filter((f) => f.itemId === d.id).length;
+      return html`<a class="row" href="#/doc/${d.id}"><span class="row-ic">${icon(c.icon)}</span>
+        <span class="row-main"><b>${d.title}</b><small>${[d.number ? `•••• ${String(d.number).slice(-4)}` : '', n ? `${n} photo${n === 1 ? '' : 's'}` : ''].filter(Boolean).join(' · ')}</small></span>
+        ${ex ? html`<span class="chip exp ${ex.cls}">${ex.text}</span>` : ''}${icon('right', 'sm dim')}</a>`;
+    })}</div>`)}
+    <button class="btn primary wide" data-act="doc-sheet">${icon('plus')} Add document</button>
+  </div>`;
+};
+
+VIEWS.doc = (t, [id]) => {
+  const d = S.docs.find((x) => x.id === id);
+  if (!d) return html`${subBar('Document', 'docs')}<div class="page"><div class="empty"><p>Not found.</p></div></div>`;
+  const files = S.docFiles.filter((f) => f.itemId === d.id);
+  const ex = expiryNote(d, t);
+  const c = DOC_CATS[d.category] || DOC_CATS.other;
+  return html`${subBar(c.label, 'docs', html`<button class="icon-btn" data-act="doc-sheet" data-id="${d.id}" aria-label="Edit">${icon('edit')}</button>`)}
+  <div class="page detail">
+    <div class="d-head"><span class="tile lg">${icon(c.icon)}</span><div><h2>${d.title}</h2>${d.holder ? html`<p>${d.holder}</p>` : ''}</div>
+      ${ex ? html`<span class="chip exp ${ex.cls}">${ex.text}</span>` : ''}</div>
+    <div class="thumbs">${files.map((f) => thumb(f))}<button class="thumb add" data-act="add-doc-files" data-id="${d.id}">${icon('plus')}<span>Add photo</span></button></div>
+    <div class="card kvs">
+      ${d.number ? html`<div class="kv"><span>Number</span><b class="mono">${d.number}</b><button class="icon-btn sm" data-act="copy" data-v="${d.number}" aria-label="Copy number">${icon('copy')}</button></div>` : ''}
+      ${d.expiry ? html`<div class="kv"><span>Expires</span><b>${fmtLongDay(d.expiry)}</b></div>` : ''}
+      ${d.phone ? html`<div class="kv"><span>Helpline</span><b>${d.phone}</b><a class="icon-btn sm" href="${telHref(d.phone)}" aria-label="Call">${icon('phone')}</a></div>` : ''}
+    </div>
+    ${d.notes ? html`<h3 class="sec-h">Notes</h3><div class="card notes">${d.notes}</div>` : ''}
+    <div class="d-actions"><button class="btn" data-act="doc-sheet" data-id="${d.id}">${icon('edit')} Edit</button>
+      <button class="btn danger-ghost" data-act="del-doc" data-id="${d.id}">${icon('trash')} Delete</button></div>
+  </div>`;
+};
+
+function docSheet(d) {
+  openSheet({
+    title: d ? 'Edit document' : 'Add document',
+    body: html`<label class="fld"><span>Type</span><select name="category">${Object.entries(DOC_CATS).map(([k, c]) => html`<option value="${k}" ${(d?.category || 'passport') === k ? raw('selected') : ''}>${c.label}</option>`)}</select></label>
+      <label class="fld"><span>Name</span><input name="title" required value="${d?.title || ''}" placeholder="e.g. UK passport, Aviva travel insurance"></label>
+      <div class="two"><label class="fld"><span>Number</span><input name="number" class="mono" value="${d?.number || ''}"></label>
+      <label class="fld"><span>Expires</span><input type="date" name="expiry" value="${d?.expiry || ''}"></label></div>
+      <div class="two"><label class="fld"><span>Holder</span><input name="holder" value="${d?.holder || ''}"></label>
+      <label class="fld"><span>Helpline</span><input type="tel" name="phone" value="${d?.phone || ''}"></label></div>
+      <label class="fld"><span>Notes</span><textarea name="notes" rows="3">${d?.notes || ''}</textarea></label>`,
+    onSubmit: async (fd) => {
+      const rec = { id: d?.id || uid('doc_'), createdAt: d?.createdAt || new Date().toISOString() };
+      for (const k of ['category', 'title', 'number', 'expiry', 'holder', 'phone', 'notes']) rec[k] = String(fd.get(k) || '').trim();
+      const i = S.docs.findIndex((x) => x.id === rec.id);
+      if (i >= 0) S.docs[i] = rec; else S.docs.push(rec);
+      await saveDocs();
+      closeSheet();
+      if (!d) go(`doc/${rec.id}`); else render();
+    },
+  });
+}
+
+async function addDocFiles(docId, fileList) {
+  for (const file of fileList) {
+    const rec = { id: uid('df_'), tripId: DOCS, itemId: docId, name: file.name || 'document', type: file.type, size: file.size, blob: file, createdAt: new Date().toISOString() };
+    rec.barcode = await detectBarcode(file);
+    await db.put('files', rec);
+    S.docFiles.push(rec);
+  }
+  askPersist();
+  render();
+  toast(`${fileList.length} photo${fileList.length === 1 ? '' : 's'} added`);
+}
+
+/* =====================================================================
+   Journal
+   ===================================================================== */
+
+const journalCount = (t, date) => (t?.journal || []).filter((j) => j.date === date).length;
+
+VIEWS.journal = (t, [date]) => {
+  if (!t) return welcome();
+  const today = isoDate(now());
+  const d = date || (today >= t.start && today <= t.end ? today : t.start);
+  const entries = (t.journal || []).filter((j) => j.date === d).sort((a, b) => (a.at || '').localeCompare(b.at || ''));
+  const prev = d > t.start ? addDays(d, -1) : null, next = d < t.end ? addDays(d, 1) : null;
+  const ro = readOnly();
+  const daysWith = [...new Set((t.journal || []).map((j) => j.date))].sort();
+  return html`${subBar('Journal', 'plan')}<div class="page">
+    <div class="day-pager">
+      ${prev ? html`<a class="icon-btn" href="#/journal/${prev}" data-replace aria-label="Previous day">${icon('left')}</a>` : html`<span class="icon-btn"></span>`}
+      <div><b>${fmtLongDay(d)}</b><small>Day ${daysBetween(t.start, d) + 1}${dayWeatherChip(t, d)}</small></div>
+      ${next ? html`<a class="icon-btn" href="#/journal/${next}" data-replace aria-label="Next day">${icon('right')}</a>` : html`<span class="icon-btn"></span>`}
+    </div>
+    ${entries.map((j) => {
+      const photos = S.files.filter((f) => f.itemId === j.id);
+      return html`<article class="card journal-entry">
+        <header><span class="avatar sm">${(j.author || '?').charAt(0).toUpperCase()}</span><b>${j.author || 'Me'}</b><small>${j.at ? hhmm(new Date(j.at)) : ''}</small>
+          ${!ro ? html`<button class="icon-btn sm" data-act="journal-edit" data-id="${j.id}" aria-label="Edit entry">${icon('edit')}</button>` : ''}</header>
+        ${j.text ? html`<p>${j.text}</p>` : ''}
+        ${photos.length || !ro ? html`<div class="thumbs">${photos.map((f) => thumb(f))}${!ro ? html`<button class="thumb add" data-act="add-files" data-item="${j.id}">${icon('image')}<span>Photos</span></button>` : ''}</div>` : ''}
+      </article>`;
+    })}
+    ${!ro ? html`<form class="card journal-new" data-form="journal">
+      <input type="hidden" name="date" value="${d}">
+      <textarea name="text" rows="4" placeholder="${entries.length ? 'Add more…' : 'What happened today? Where did you eat, who did you see?'}" required></textarea>
+      <button class="btn primary">${icon('plus')} Add entry</button>
+    </form>` : ''}
+    ${daysWith.length ? html`<h2 class="sec-h">Days with entries</h2><div class="chips">${daysWith.map((x) => html`<a class="chip-link ${x === d ? 'on' : ''}" href="#/journal/${x}" data-replace>${fmtDay(x)} · ${journalCount(t, x)}</a>`)}</div>` : ''}
+    ${S.synced[t.id] ? html`<p class="hint">Shared live: entries and photos appear on Jane's phone too.</p>` : ''}
+  </div>`;
+};
+
+/* =====================================================================
+   Weather & Plan B
+   ===================================================================== */
+
+const wxPending = new Set();
+let wxRenderTimer = null;
+
+function scheduleQuietRender() {
+  clearTimeout(wxRenderTimer);
+  wxRenderTimer = setTimeout(() => {
+    if (['edit', 'new', 'ask'].includes(S.route.name) || sheetRoot.classList.contains('open')) return;
+    const y = window.scrollY;
+    render();
+    window.scrollTo(0, y);
+  }, 400);
+}
+
+/** Forecast for a place, if loaded. Starts loading it in the background otherwise. */
+function wxFor(place) {
+  if (!place) return null;
+  const key = place.toLowerCase();
+  if (S.weather[key]) return S.weather[key].data;
+  if (!wxPending.has(key)) {
+    wxPending.add(key);
+    (async () => {
+      const g = await geocode(place);
+      const data = g ? await forecast(g.lat, g.lon) : null;
+      S.weather[key] = { geo: g, data };
+      if (data) scheduleQuietRender();
+    })().catch(() => { S.weather[key] = { data: null }; });
+  }
+  return null;
+}
+
+const inForecastRange = (date) => date && date >= isoDate(now()) && daysBetween(isoDate(now()), date) <= 15;
+
+/** Where the traveller is on a date: the last leg's destination, carried forward. */
+function placeOn(t, date) {
+  let place = '';
+  const legs = t.items.filter((i) => isTransport(i) && i.date && i.status !== 'cancelled').sort((a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || '')));
+  for (const leg of legs) {
+    if (leg.date > date) { if (!place) place = leg.from; break; }
+    if (leg.to) place = leg.to;
+  }
+  return place || legs[0]?.from || '';
+}
+
+function dayWeatherChip(t, date) {
+  if (!inForecastRange(date) || isPreview()) return '';
+  const data = wxFor(placeOn(t, date));
+  const d = daily(data, date);
+  if (!d) return '';
+  const c = describeCode(d.code);
+  return html`<span class="wx" title="${c.label}${d.rain != null ? `, ${d.rain}% chance of rain` : ''}">${c.emoji} ${d.max}°</span>`;
+}
+
+function riskFor(it) {
+  if (!isTransport(it) || !isWeatherSensitive(it) || it.status === 'cancelled' || !inForecastRange(it.date)) return null;
+  const dep = hourly(wxFor(it.from), it.date, it.time);
+  const arr = it.to ? hourly(wxFor(it.to), it.endDate || it.date, it.endTime || it.time) : null;
+  if (!dep && !arr) return null;
+  const r = legRisk(it.type, [{ place: it.from, w: dep }, { place: it.to, w: arr }]);
+  return { ...r, dep, arr };
+}
+
+const RISK_TEXT = ['Weather looks fine', 'Weather could disrupt this leg', 'Weather likely to disrupt this leg'];
+
+function riskBadge(it) {
+  const r = riskFor(it);
+  if (!r) return '';
+  return html`<div class="risk lv${r.level}">${r.level ? icon('alert', 'sm') : icon('check', 'sm')}<span>${RISK_TEXT[r.level]}${r.reasons.length ? `: ${r.reasons[0]}` : ''}</span></div>`;
+}
+
+function riskBanner(it) {
+  const r = riskFor(it);
+  if (!r || !r.level) return '';
+  return html`<a class="banner ${r.level === 2 ? 'bad' : 'warn'}" href="#/item/${it.id}">${icon('alert', 'sm')}<div><b>${RISK_TEXT[r.level]}</b>
+    <span>${r.reasons.join(', ')}. ${it.planB ? 'See your Plan B.' : 'Check the operator before you set off.'}</span></div></a>`;
+}
+
+function wxLine(label, place, w) {
+  if (!w) return '';
+  const c = describeCode(w.code);
+  return html`<div class="wx-row"><span>${label}<small>${place}</small></span><b>${c.emoji} ${w.temp}°</b><span>${c.label}${w.rain != null ? ` · ${w.rain}% rain` : ''}<small>Wind ${w.wind} mph, gusts ${w.gusts}</small></span></div>`;
+}
+
+function weatherSection(it) {
+  if (!isTransport(it) || isPreview()) return '';
+  const r = riskFor(it);
+  const sensitive = isWeatherSensitive(it);
+  if (!r && !it.planB) {
+    return sensitive && it.date && !inForecastRange(it.date) && it.date > isoDate(now())
+      ? html`<h3 class="sec-h">Weather & Plan B</h3><div class="slim quiet">${icon('clock', 'sm')}<span>A forecast appears here about two weeks before ${fmtDay(it.date)}.</span></div>`
+      : '';
+  }
+  return html`<h3 class="sec-h">Weather & Plan B</h3>
+    <div class="card wx-card">
+      ${r ? html`<div class="risk lv${r.level} big">${r.level ? icon('alert', 'sm') : icon('check', 'sm')}<span>${RISK_TEXT[r.level]}${r.reasons.length ? `: ${r.reasons.join(', ')}` : ''}</span></div>
+        ${wxLine(`Departs ${it.time || ''}`, it.from, r.dep)}${wxLine(`Arrives ${it.endTime || ''}`, it.to, r.arr)}
+        <p class="hint">A rough guide from the forecast, not the operator's decision. Small island aircraft are grounded by strong crosswinds and fog well before larger ones.</p>` : ''}
+      ${it.planB ? html`<div class="planb"><b>${icon('refresh', 'sm')} Plan B</b><p>${it.planB}</p></div>`
+        : sensitive && !readOnly() ? html`<a class="btn xs" href="#/edit/${it.id}">${icon('plus', 'sm')} Write a Plan B</a>` : ''}
+    </div>`;
+}
+
+/* =====================================================================
+   Live sync through the server
+   ===================================================================== */
+
+const syncTimers = {};
+const syncing = {};
+
+function scheduleSync(id, delay = 1500) {
+  clearTimeout(syncTimers[id]);
+  syncTimers[id] = setTimeout(() => syncTrip(id), delay);
+}
+
+function updateSyncPill() {
+  const el = document.querySelector('.pill.sync');
+  if (!el) return;
+  const st = S.sync.state;
+  el.className = `pill sync ${st}`;
+  el.lastChild.textContent = ` ${st === 'busy' ? 'Syncing' : st === 'error' ? 'Not synced' : 'Shared'}`;
+}
+
+async function syncTrip(id) {
+  if (!getServer() || !navigator.onLine || !S.synced[id]) return;
+  if (syncing[id]) { syncing[id].again = true; return; }
+  syncing[id] = {};
+  S.sync = { ...S.sync, state: 'busy' };
+  updateSyncPill();
+  let changed = false;
+  try {
+    const local = S.trips.find((t) => t.id === id);
+    if (!local) return;
+    const { trip: remote, rev } = await api(`/api/trips/${encodeURIComponent(id)}/sync`, { method: 'POST', body: { trip: forServer(local) } });
+    const current = S.trips.find((t) => t.id === id) || local;
+    const merged = mergeTrips(current, remote);
+    if (!sameContent(merged, current)) { await storeTrip(merged); changed = true; }
+    if (!sameContent(merged, remote)) syncing[id].again = true;
+    changed = (await syncFiles(id, merged)) || changed;
+    S.synced[id] = { rev, at: new Date().toISOString() };
+    await db.put('meta', S.synced, 'synced');
+    S.sync = { state: 'ok', error: '', at: Date.now() };
+  } catch (e) {
+    S.sync = { state: 'error', error: e.message };
+  } finally {
+    const again = syncing[id]?.again;
+    delete syncing[id];
+    if (changed) scheduleQuietRender(); else updateSyncPill();
+    if (again && S.sync.state !== 'error') scheduleSync(id, 300);
+  }
+}
+
+const fileMeta = (f) => ({ itemId: f.itemId, name: f.name, label: f.label || '', order: f.order ?? 0, createdAt: f.createdAt, barcode: f.barcode || null, metaAt: f.metaAt || '' });
+
+async function syncFiles(id, t) {
+  const remote = await api(`/api/trips/${encodeURIComponent(id)}/files`);
+  const local = await db.byIndex('files', 'tripId', id);
+  const gone = t.deleted || {};
+  const rmap = new Map(remote.map((f) => [f.id, f]));
+  let changed = false;
+  for (const f of local) {
+    if (gone[f.id]) { await db.del('files', f.id); changed = true; continue; }
+    const r = rmap.get(f.id);
+    if (!r) {
+      const meta = btoa(unescape(encodeURIComponent(JSON.stringify(fileMeta(f)))));
+      await api(`/api/files/${encodeURIComponent(f.id)}?trip=${encodeURIComponent(id)}`, { method: 'PUT', body: f.blob, headers: { 'Content-Type': f.type || 'application/octet-stream', 'X-File-Meta': meta }, timeout: 120000 });
+    } else if ((f.metaAt || '') > (r.meta.metaAt || '')) {
+      await api(`/api/files/${encodeURIComponent(f.id)}`, { method: 'PATCH', body: { meta: fileMeta(f) } });
+    } else if ((r.meta.metaAt || '') > (f.metaAt || '')) {
+      Object.assign(f, { itemId: r.meta.itemId, label: r.meta.label, order: r.meta.order, metaAt: r.meta.metaAt });
+      await db.put('files', f);
+      changed = true;
+    }
+  }
+  const have = new Set(local.map((f) => f.id));
+  for (const r of remote) {
+    if (have.has(r.id) || gone[r.id]) continue;
+    const res = await api(`/api/files/${encodeURIComponent(r.id)}`, { raw: true, timeout: 120000 });
+    const blob = await res.blob();
+    await db.put('files', { id: r.id, tripId: id, type: r.type, size: r.size, blob, ...r.meta });
+    changed = true;
+  }
+  if (changed && id === S.tripId) await loadFiles();
+  return changed;
+}
+
+async function refreshAccount() {
+  if (!getServer() || !navigator.onLine) return;
+  try {
+    S.account = await api('/api/me');
+    await db.put('meta', S.account, 'account');
+  } catch (e) {
+    if (e.status === 401) toast('This phone’s server access was refused. Ask for a new connect link.');
+  }
+  scheduleQuietRender();
+}
+
+VIEWS.connect = () => {
+  const c = S.incomingConnect;
+  return html`${subBar('Connect this phone', 'today')}<div class="page">
+    <div class="card save-card">
+      <p>Connect Travel Pack on this phone to your server as <b>${c.name}</b>?</p>
+      <p class="hint">${c.url}</p>
+      <p class="hint">This turns on live sharing between phones, email search and the AI assistant. Your trips stay on this phone as well.</p>
+      <div class="row-btns"><button class="btn primary" data-act="connect-confirm">${icon('check')} Connect</button>
+      <a class="btn ghost" href="#/today" data-act="connect-cancel">Cancel</a></div>
+    </div>
+  </div>`;
+};
+
+VIEWS.sync = (t) => {
+  const srv = getServer();
+  if (!srv) {
+    return html`${subBar('Live sharing & server', 'more')}<div class="page">
+      <div class="card tip static">${icon('info')}<div><b>Not connected</b><span>Open the connect link you were sent on this phone. It links Travel Pack to your private server for live sharing, email search and the AI assistant.</span></div></div></div>`;
+  }
+  const a = S.account;
+  const on = t && S.synced[t.id];
+  const local = new Set(S.trips.map((x) => x.id));
+  return html`${subBar('Live sharing & server', 'more')}<div class="page">
+    <div class="card kvs">
+      <div class="kv"><span>Connected as</span><b>${srv.name}</b></div>
+      <div class="kv"><span>Assistant</span><b>${a ? (a.ai ? 'Ready' : 'Not set up on the server') : 'Checking…'}</b></div>
+      <div class="kv"><span>Gmail</span><b>${a ? (!a.gmail.available ? 'Not set up on the server' : a.gmail.connected ? a.gmail.email || 'Connected' : 'Not connected') : '…'}</b>
+        ${a?.gmail?.available ? html`<a class="btn xs" href="#/email">${a.gmail.connected ? 'Open' : 'Connect'}</a>` : ''}</div>
+    </div>
+    ${t && !t.readOnly ? html`<h2 class="sec-h">${t.name}</h2><div class="card list-card">
+      ${on ? html`<div class="row"><span class="row-ic">${icon('refresh')}</span><span class="row-main"><b>Shared live</b>
+          <small>${S.sync.state === 'error' ? `Last attempt failed: ${S.sync.error}` : S.synced[t.id].at ? `Synced ${fmtUntil(new Date(S.synced[t.id].at), new Date())}` : 'Waiting to sync'}</small></span>
+          <button class="btn xs" data-act="sync-now">Sync now</button></div>
+        <button class="row" data-act="sync-off"><span class="row-ic">${icon('x')}</span><span class="row-main"><b>Stop sharing on this phone</b><small>Keeps the server copy for others</small></span></button>`
+      : html`<button class="row" data-act="sync-on"><span class="row-ic">${icon('refresh')}</span><span class="row-main"><b>Share this trip live</b><small>Anyone connected to your server (e.g. Jane) can see and edit it, tickets and journal included. Changes appear on every phone.</small></span>${icon('right', 'sm dim')}</button>`}
+    </div>` : ''}
+    <h2 class="sec-h">Trips on the server</h2>
+    <div class="card list-card">${S.serverTrips == null ? html`<div class="row"><span class="row-main"><small>${S.online ? 'Loading…' : 'Needs signal'}</small></span></div>`
+      : S.serverTrips.length ? S.serverTrips.map((x) => html`<div class="row"><span class="row-ic">${icon('suitcase')}</span>
+          <span class="row-main"><b>${x.name}</b><small>${fmtRange(x.start, x.end)} · ${x.items} booking${x.items === 1 ? '' : 's'}</small></span>
+          ${local.has(x.id) ? html`<span class="chip st-confirmed">On this phone</span>` : html`<button class="btn xs primary" data-act="pull-trip" data-id="${x.id}">Download</button>`}</div>`)
+      : html`<div class="row"><span class="row-main"><small>No trips shared yet.</small></span></div>`}</div>
+    <button class="btn danger-ghost wide" data-act="disconnect">Disconnect this phone</button>
+  </div>`;
+};
+
+/* =====================================================================
+   Email (Gmail through the server)
+   ===================================================================== */
+
+const DEFAULT_EMAIL_Q = 'newer_than:90d (booking OR reservation OR confirmation OR e-ticket OR itinerary OR invoice)';
+const EMAIL_CHIPS = ['Premier Inn', 'Loganair', 'NorthLink', 'Trainline', 'booking confirmation', 'has:attachment ticket'];
+
+async function emailSearch(q) {
+  S.email = { ...S.email, q, busy: true, error: '' };
+  render();
+  try {
+    S.email.results = await api(`/api/gmail/search?q=${encodeURIComponent(q || DEFAULT_EMAIL_Q)}`);
+  } catch (e) {
+    S.email.error = e.message;
+    if (e.status === 409) refreshAccount();
+  }
+  S.email.busy = false;
+  if (S.route.name === 'email') render();
+}
+
+VIEWS.email = (t) => {
+  const a = S.account;
+  const head = subBar('Search email', 'more');
+  if (!getServer()) return html`${head}<div class="page"><div class="card tip static">${icon('info')}<div><b>Connect to your server first</b><span>Email search runs through your private Travel Pack server.</span></div></div><a class="btn wide" href="#/sync">Live sharing & server</a></div>`;
+  if (a && !a.gmail.available) return html`${head}<div class="page"><div class="card tip static">${icon('info')}<div><b>Gmail isn't set up on the server yet</b><span>It needs a Google client ID and secret in the server settings.</span></div></div></div>`;
+  if (a && !a.gmail.connected) {
+    return html`${head}<div class="page"><div class="empty welcome">
+      <div class="logo-big">${icon('message')}</div><h2>Find bookings in Gmail</h2>
+      <p>Sign in with Google once. Travel Pack gets read-only access: it can search and read your email, never send or delete anything.</p>
+      <button class="btn primary wide" data-act="gmail-connect">${icon('external')} Connect Gmail</button>
+      ${!S.online ? html`<p class="hint">Needs signal.</p>` : ''}</div></div>`;
+  }
+  if (S.email.results == null && !S.email.busy && !S.email.error && S.online && a) setTimeout(() => emailSearch(''), 0);
+  const r = S.email.results || [];
+  return html`${head}<div class="page">
+    <form class="search" data-form="email-search" role="search"><input name="q" value="${S.email.q}" placeholder="Search Gmail (e.g. Premier Inn)" aria-label="Search email"><button class="btn primary" aria-label="Search">${icon('scan')}</button></form>
+    <div class="chips">${EMAIL_CHIPS.map((c) => html`<button class="chip-link" data-act="email-chip" data-q="${c}">${c}</button>`)}</div>
+    ${S.email.busy ? html`<div class="slim quiet"><span class="spinner"></span><span>Searching…</span></div>` : ''}
+    ${S.email.error ? html`<div class="banner warn">${icon('alert', 'sm')}<div><b>Search failed</b><span>${S.email.error}</span></div></div>` : ''}
+    ${!S.email.busy && S.email.results && !r.length ? html`<div class="empty"><p>No emails found.</p></div>` : ''}
+    <div class="card list-card">${r.map((m) => html`<a class="row mail-row" href="#/mail/${m.id}">
+      <span class="row-main"><b>${m.subject || '(no subject)'}</b><small>${(m.from || '').replace(/<.*>/, '').trim()} · ${new Date(m.date).toLocaleDateString('en-GB', { day: 'numeric', month: 'short' })}</small><small class="clamp">${m.snippet}</small></span></a>`)}</div>
+    ${!S.email.q && r.length ? html`<p class="hint">Showing recent emails that look like bookings. Search for anything else above.</p>` : ''}
+  </div>`;
+};
+
+VIEWS.mail = (t, [id]) => {
+  const m = S.email.msg;
+  if (!m || m.id !== id) {
+    if (!S.email.loading) {
+      S.email.loading = id;
+      api(`/api/gmail/messages/${encodeURIComponent(id)}`).then((msg) => { S.email.msg = msg; }).catch((e) => { S.email.msgError = e.message; })
+        .finally(() => { S.email.loading = null; if (S.route.name === 'mail') render(); });
+    }
+    return html`${subBar('Email', 'email')}<div class="page">${S.email.msgError ? html`<div class="banner warn">${icon('alert', 'sm')}<div><b>Could not open</b><span>${S.email.msgError}</span></div></div>` : html`<div class="slim quiet"><span class="spinner"></span><span>Opening…</span></div>`}</div>`;
+  }
+  const aiOk = S.account?.ai && t && !t.readOnly;
+  return html`${subBar('Email', 'email')}<div class="page mail">
+    <h2 class="mail-subject">${m.subject}</h2>
+    <p class="hint">${m.from}<br>${new Date(m.date).toLocaleString('en-GB', { dateStyle: 'medium', timeStyle: 'short' })}</p>
+    ${aiOk ? html`<button class="btn primary wide" data-act="ai-email" data-id="${m.id}">${icon('sparkle')} Create bookings from this email</button>` : ''}
+    ${m.attachments.length ? html`<h3 class="sec-h">Attachments</h3><div class="card list-card">${m.attachments.map((x) => html`<div class="row">
+      <span class="row-ic">${icon(x.type.startsWith('image/') ? 'image' : 'file')}</span>
+      <span class="row-main"><b>${x.name}</b><small>${fmtBytes(x.size)}</small></span>
+      ${t && !t.readOnly ? html`<button class="btn xs" data-act="mail-save" data-msg="${m.id}" data-att="${x.id}" data-name="${x.name}" data-type="${x.type}">${icon('ticket', 'sm')} Save as ticket</button>` : ''}
+    </div>`)}</div>` : ''}
+    <h3 class="sec-h">Message</h3>
+    <div class="card notes mail-body">${m.text || '(empty)'}</div>
+  </div>`;
+};
+
+/* =====================================================================
+   AI: bookings from emails / screenshots, and the trip assistant
+   ===================================================================== */
+
+function busySheet(text) {
+  openSheet({ title: text, body: html`<div class="busy"><span class="spinner big"></span><p class="hint">This usually takes 10 to 30 seconds.</p></div>`, submit: '' });
+}
+
+function tripForAi(t) {
+  const x = forServer(t);
+  delete x.deleted;
+  return x;
+}
+
+function fromAi(x) {
+  const it = {};
+  for (const [k, v] of Object.entries(x || {})) {
+    if (['costAmount', 'costStatus', 'costNote'].includes(k)) continue;
+    if (v !== '' && v != null) it[k] = v;
+  }
+  if (x?.costAmount > 0 && x.costStatus !== 'none') it.cost = { amount: x.costAmount, status: x.costStatus, note: x.costNote || '' };
+  if (it.type === 'train') {
+    if (!it.fromCode) it.fromCode = stationCode(it.from);
+    if (!it.toCode) it.toCode = stationCode(it.to);
+  }
+  return it;
+}
+
+async function runExtract(path, body, source) {
+  const t = trip();
+  busySheet('Reading with Claude…');
+  try {
+    const out = await api(path, { method: 'POST', body: { ...body, trip: t ? tripForAi(t) : null }, timeout: 180000 });
+    closeSheet();
+    S.ai = {
+      source, summary: out.summary,
+      items: out.items.map((p) => ({ existingId: t?.items.some((i) => i.id === p.updatesExistingId) ? p.updatesExistingId : '', item: fromAi(p.item), state: 'pending' })),
+    };
+    go('ai');
+  } catch (e) {
+    closeSheet();
+    toast(e.message);
+  }
+}
+
+const fileToB64 = (blob) => new Promise((res, rej) => { const r = new FileReader(); r.onload = () => res(String(r.result).split(',')[1]); r.onerror = rej; r.readAsDataURL(blob); });
+
+/** Phone screenshots are large; the model reads a 1600px image just as well. */
+async function shrinkImage(blob) {
+  if (!blob.type.startsWith('image/') || blob.size < 600000) return blob;
+  try {
+    const bmp = await createImageBitmap(blob);
+    const scale = Math.min(1, 1600 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+    c.getContext('2d').drawImage(bmp, 0, 0, c.width, c.height);
+    return await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.85));
+  } catch { return blob; }
+}
+
+async function attachmentsFrom(files) {
+  const out = [];
+  for (const f of files) {
+    if (!/^(image\/(png|jpeg|gif|webp)|application\/pdf)$/.test(f.type)) continue;
+    const b = await shrinkImage(f);
+    out.push({ type: b.type, data: await fileToB64(b) });
+  }
+  return out;
+}
+
+VIEWS.ai = (t) => {
+  const r = S.ai;
+  if (!r || !t) return VIEWS.today(t);
+  const pending = r.items.filter((x) => x.state === 'pending');
+  return html`${subBar('Check and add', 'plan')}<div class="page">
+    <div class="ai-summary">${icon('sparkle')}<p>${r.summary || 'Here is what Claude found.'}</p></div>
+    ${!r.items.length ? html`<div class="empty"><p>No bookings found${r.source ? ` in this ${r.source}` : ''}.</p></div>` : ''}
+    ${r.items.map((p, i) => {
+      const it = p.item;
+      const existing = p.existingId ? t.items.find((x) => x.id === p.existingId) : null;
+      const T = typeOf(it);
+      return html`<div class="card ai-card ${p.state}">
+        <div class="entry-top"><span class="tile t-${it.type}">${icon(T.icon)}</span><span class="entry-kicker">${existing ? `Updates: ${itemTitle(existing)}` : `New ${T.label.toLowerCase()}`}</span>${chip(it.status || 'confirmed')}</div>
+        <div class="entry-title">${itemTitle(it)}</div>
+        ${itemSubtitle(it) ? html`<div class="entry-sub">${itemSubtitle(it)}</div>` : ''}
+        <div class="kvs-mini">
+          <span>${fmtDay(it.date)}${it.time ? ` · ${it.time}` : ''}${it.endTime || it.endDate ? ` → ${it.endDate && it.endDate !== it.date ? fmtDay(it.endDate) + ' ' : ''}${it.endTime || ''}` : ''}</span>
+          ${it.ref ? html`<span class="mono">${it.ref}</span>` : ''}${it.seat ? html`<span>${it.seat}</span>` : ''}
+          ${it.cost ? html`<span>${money(it.cost.amount)} · ${COST_STATUS[it.cost.status]}</span>` : ''}
+        </div>
+        ${!it.date ? html`<p class="entry-note">No date found: edit before adding.</p>` : ''}
+        ${p.state === 'pending' ? html`<div class="row-btns">
+          ${it.date ? html`<button class="btn primary xs" data-act="ai-apply" data-i="${i}">${icon('check', 'sm')} ${existing ? 'Update' : 'Add'}</button>` : ''}
+          <button class="btn xs" data-act="ai-edit" data-i="${i}">${icon('edit', 'sm')} Edit first</button>
+          <button class="btn ghost xs" data-act="ai-skip" data-i="${i}">Skip</button></div>`
+        : html`<p class="hint">${p.state === 'done' ? (existing ? 'Updated' : 'Added') : 'Skipped'}</p>`}
+      </div>`;
+    })}
+    ${pending.filter((p) => p.item.date).length > 1 ? html`<button class="btn primary wide" data-act="ai-apply-all">${icon('check')} Add all</button>` : ''}
+    <p class="hint">Check references and times against the original. Claude can misread.</p>
+  </div>`;
+};
+
+function applyAi(p) {
+  const t = trip();
+  if (p.existingId) {
+    const cur = t.items.find((x) => x.id === p.existingId);
+    if (cur) { putItem(t, { ...structuredClone(cur), ...p.item, id: cur.id }); return cur.id; }
+  }
+  const it = { id: uid('it_'), people: [], status: 'confirmed', ...p.item };
+  putItem(t, it);
+  return it.id;
+}
+
+const CHAT_SUGGESTIONS = ["What's next, and when do I need to leave?", 'Is anything still to book or pay?', 'Summarise tomorrow for me', 'How do I get from the hotel to Terminal 2?'];
+
+async function loadChat(id) {
+  if (!S.chat[id]) S.chat[id] = (await db.get('meta', 'chat:' + id)) || [];
+  return S.chat[id];
+}
+
+VIEWS.ask = (t) => {
+  if (!t) return welcome();
+  if (!S.chat[t.id]) { loadChat(t.id).then(() => render()); return html`${subBar('Ask', 'today')}<div class="page"></div>`; }
+  const msgs = S.chat[t.id];
+  return html`${subBar('Ask Travel Pack', 'today', msgs.length ? html`<button class="icon-btn" data-act="chat-clear" aria-label="Clear conversation">${icon('trash')}</button>` : '')}
+  <div class="page chat">
+    ${!msgs.length ? html`<div class="ai-summary">${icon('sparkle')}<p>Ask anything about ${t.name}: timings, connections, what to do if something's cancelled. You can also ask for changes ("my lift on Saturday is at 10:30") and approve them here.</p></div>
+      <div class="chips col">${CHAT_SUGGESTIONS.map((q) => html`<button class="chip-link" data-act="chat-suggest" data-q="${q}">${q}</button>`)}</div>` : ''}
+    ${msgs.map((m, mi) => html`<div class="bubble ${m.role}"><span class="bubble-text">${m.content}</span>
+      ${(m.changes || []).map((c, ci) => {
+        const cur = c.itemId ? t.items.find((x) => x.id === c.itemId) : null;
+        const it = c.action === 'delete' ? cur : fromAi(c.item);
+        return html`<div class="change ${c.state}">
+          <b>${c.action === 'add' ? 'Add' : c.action === 'update' ? 'Change' : 'Remove'}: ${it ? itemTitle(it) : 'booking'}</b>
+          ${it ? html`<small>${fmtDay(it.date)}${it.time ? ` · ${it.time}` : ''}${c.reason ? ` · ${c.reason}` : ''}</small>` : ''}
+          ${c.state === 'pending' ? html`<div class="row-btns"><button class="btn primary xs" data-act="chat-apply" data-m="${mi}" data-c="${ci}">Apply</button>
+            <button class="btn ghost xs" data-act="chat-dismiss" data-m="${mi}" data-c="${ci}">Dismiss</button></div>` : html`<small>${c.state === 'applied' ? 'Applied' : 'Dismissed'}</small>`}
+        </div>`;
+      })}</div>`)}
+    ${S.chatBusy ? html`<div class="bubble assistant"><span class="spinner"></span> Thinking…</div>` : ''}
+    <form class="chat-input" data-form="ask"><textarea name="q" rows="1" placeholder="${S.online ? 'Ask about your trip…' : 'Needs signal'}" ${S.chatBusy || !S.online ? raw('disabled') : ''} required></textarea>
+      <button class="btn primary" aria-label="Send" ${S.chatBusy ? raw('disabled') : ''}>${icon('arrow')}</button></form>
+  </div>`;
+};
+
+function describeNow() {
+  const n = now();
+  return `${fmtLongDay(isoDate(n))} ${hhmm(n)}, UK local time`;
+}
+
+async function askAssistant(q) {
+  const t = trip();
+  const msgs = await loadChat(t.id);
+  msgs.push({ role: 'user', content: q });
+  S.chatBusy = true;
+  render();
+  scrollChat();
+  try {
+    const out = await api('/api/ai/chat', { method: 'POST', body: { trip: tripForAi(t), messages: msgs.map(({ role, content }) => ({ role, content })), now: describeNow() }, timeout: 180000 });
+    msgs.push({ role: 'assistant', content: out.reply, changes: (out.changes || []).map((c) => ({ ...c, state: 'pending' })) });
+  } catch (e) {
+    msgs.push({ role: 'assistant', content: `Sorry, that didn't work: ${e.message}` });
+  }
+  S.chatBusy = false;
+  S.chat[t.id] = msgs.slice(-40);
+  await db.put('meta', S.chat[t.id], 'chat:' + t.id);
+  if (S.route.name === 'ask') { render(); scrollChat(); }
+}
+
+function scrollChat() {
+  requestAnimationFrame(() => window.scrollTo({ top: document.body.scrollHeight }));
 }
 
 /* =====================================================================
@@ -961,6 +1737,7 @@ function toast(msg, action) {
 const fileInput = document.getElementById('file-input');
 const importInput = document.getElementById('import-input');
 let pendingItem = null;
+let pendingDoc = null;
 
 async function detectBarcode(blob) {
   if (!('BarcodeDetector' in window) || !blob.type.startsWith('image/')) return null;
@@ -993,6 +1770,7 @@ async function addFiles(itemId, fileList) {
     S.files.push(rec);
   }
   askPersist();
+  if (S.synced[t.id]) scheduleSync(t.id);
   render();
   const n = fileList.length;
   toast(`${n} ticket${n === 1 ? '' : 's'} added${found ? ` · ${found} barcode${found === 1 ? '' : 's'} found` : ''}`);
@@ -1001,7 +1779,9 @@ async function addFiles(itemId, fileList) {
 fileInput.addEventListener('change', async () => {
   const files = [...fileInput.files];
   fileInput.value = '';
-  if (files.length && pendingItem) await addFiles(pendingItem, files);
+  if (!files.length) return;
+  if (pendingDoc) { const d = pendingDoc; pendingDoc = null; await addDocFiles(d, files); return; }
+  if (pendingItem) await addFiles(pendingItem, files);
 });
 
 importInput.addEventListener('change', async () => {
@@ -1037,7 +1817,7 @@ async function importBundleFile(file) {
   const clashes = bundle.trips.filter((t) => S.trips.some((x) => x.id === t.id));
   openSheet({
     title: bundle.kind === 'backup' ? 'Restore backup?' : `Import “${bundle.trips[0]?.name}”?`,
-    body: html`<p>${bundle.trips.length} trip${bundle.trips.length === 1 ? '' : 's'} · ${nFiles} ticket${nFiles === 1 ? '' : 's'}.</p>
+    body: html`<p>${bundle.trips.length} trip${bundle.trips.length === 1 ? '' : 's'} · ${nFiles} file${nFiles === 1 ? '' : 's'}${bundle.docs?.length ? ` · ${bundle.docs.length} document${bundle.docs.length === 1 ? '' : 's'}` : ''}.</p>
       ${clashes.length ? html`<label class="check"><input type="checkbox" name="copy"><span>Keep my current version too (import as a copy)</span></label>
       <p class="hint">Otherwise ${clashes.map((c) => c.name).join(', ')} will be replaced.</p>` : ''}`,
     submit: 'Import',
@@ -1058,7 +1838,14 @@ async function importBundleFile(file) {
         }
         if (bundle.trips.length === 1) await setCurrentTrip(target.id);
       }
-      if (!S.tripId) await setCurrentTrip(S.trips[0].id);
+      if (Array.isArray(bundle.docs) && bundle.docs.length) {
+        const byId = new Map(S.docs.map((d) => [d.id, d]));
+        for (const d of bundle.docs) byId.set(d.id, d);
+        S.docs = [...byId.values()];
+        await db.put('meta', S.docs, 'docs');
+        for (const f of bundle.files.filter((f) => f.tripId === DOCS)) await db.put('files', f);
+      }
+      if (!S.tripId && S.trips.length) await setCurrentTrip(S.trips[0].id);
       await loadFiles();
       toast('Imported');
       go('today');
@@ -1142,28 +1929,62 @@ const ACT = {
   'close-sheet': () => closeSheet(),
   copy: (el) => copyText(el.dataset.v),
   'goto-day': (el, e) => { e.preventDefault(); S.pendingDay = el.dataset.day; go('plan'); },
-  'new-item': () => {
+  'new-item': (el) => {
+    const date = el?.dataset?.date || '';
+    const aiOk = getServer() && S.account?.ai;
     openSheet({
-      title: 'Add a booking', submit: '',
-      body: html`<div class="type-grid">${Object.entries(TYPES).map(([k, v]) => html`<button type="button" class="type-opt" data-act="pick-type" data-type="${k}">${icon(v.icon)}<span>${v.label}</span></button>`)}</div>`,
+      title: date ? `Add to ${fmtDay(date)}` : 'Add a booking', submit: '',
+      body: html`${aiOk ? html`<button type="button" class="ai-entry" data-act="ai-sheet">${icon('sparkle')}<div><b>From an email, PDF or screenshot</b><span>Claude reads it and fills in the booking for you to check</span></div></button>` : ''}
+        <div class="type-grid">${Object.entries(TYPES).map(([k, v]) => html`<button type="button" class="type-opt" data-act="pick-type" data-type="${k}" data-date="${date}">${icon(v.icon)}<span>${v.label}</span></button>`)}</div>`,
     });
   },
-  'pick-type': (el) => { closeSheet(); S.draft = null; go(`new/${el.dataset.type}`); },
+  'pick-type': (el) => { closeSheet(); S.draft = null; go(`new/${el.dataset.type}${el.dataset.date ? '/' + el.dataset.date : ''}`); },
   'add-files': (el) => { pendingItem = el.dataset.item; fileInput.click(); },
   async 'del-item'(el) {
     const t = trip();
     const it = t.items.find((i) => i.id === el.dataset.item);
     if (!it) return;
-    const n = filesFor(it.id).length;
-    if (!(await confirmBox(`Delete “${itemTitle(it)}”${n ? ` and its ${n} ticket${n === 1 ? '' : 's'}` : ''}?`))) return;
+    const files = filesFor(it.id);
+    if (!(await confirmBox(`Delete “${itemTitle(it)}”${files.length ? ` and its ${files.length} ticket${files.length === 1 ? '' : 's'}` : ''}?`))) return;
     closeSheet();
+    const index = t.items.indexOf(it);
     t.items = t.items.filter((i) => i.id !== it.id);
-    await db.delWhere('files', 'itemId', it.id);
-    S.files = S.files.filter((f) => f.itemId !== it.id);
     S.draft = null;
     await saveTrip(t, { quiet: true });
-    toast('Booking deleted');
     go('plan');
+    // Tickets go only once the chance to undo has passed.
+    const undo = { done: false };
+    const purge = setTimeout(async () => {
+      if (undo.done) return;
+      for (const f of files) { await db.del('files', f.id); tombstone(t, f.id); }
+      S.files = S.files.filter((f) => f.itemId !== it.id);
+      if (files.length) await saveTrip(t, { quiet: true });
+    }, 9000);
+    S.undo = async () => {
+      undo.done = true;
+      clearTimeout(purge);
+      t.items.splice(Math.min(index, t.items.length), 0, it);
+      await saveTrip(t);
+      toast('Booking restored');
+    };
+    toast('Booking deleted', { act: 'undo', label: 'Undo' });
+  },
+  undo: () => { const u = S.undo; S.undo = null; if (u) u(); },
+  'status-sheet': (el) => {
+    const t = trip();
+    const it = t.items.find((i) => i.id === el.dataset.item);
+    openSheet({
+      title: 'Status', submit: '',
+      body: html`<div class="status-list">${Object.entries(STATUS).map(([k, v]) => html`<button type="button" class="status-opt ${it.status === k ? 'on' : ''}" data-act="set-status" data-item="${it.id}" data-status="${k}">${chip(k)}${it.status === k ? icon('check', 'sm') : ''}</button>`)}</div>`,
+    });
+  },
+  async 'set-status'(el) {
+    const t = trip();
+    const it = t.items.find((i) => i.id === el.dataset.item);
+    it.status = el.dataset.status;
+    closeSheet();
+    await saveTrip(t);
+    toast(`Marked ${STATUS[it.status].label.toLowerCase()}`);
   },
   async 'dup-item'(el) {
     const t = trip();
@@ -1189,13 +2010,13 @@ const ACT = {
   },
   'toggle-crop': (el, e) => {
     if (e.target.closest('.v-pdf')) return;
-    const f = S.files.find((x) => x.id === S.route.parts[0]);
+    const f = anyFile(S.route.parts[0]);
     if (!f?.barcode) return;
     S.showWhole = !S.showWhole;
     render();
   },
   'open-file': (el) => {
-    const f = S.files.find((x) => x.id === el.dataset.file);
+    const f = anyFile(el.dataset.file);
     window.open(fileUrl(f), '_blank');
   },
   'file-menu': (el) => {
@@ -1210,21 +2031,32 @@ const ACT = {
       onSubmit: async (fd) => {
         f.label = String(fd.get('label')).trim();
         f.itemId = String(fd.get('itemId'));
+        f.metaAt = new Date().toISOString();
         await db.put('files', f);
+        if (S.synced[f.tripId]) scheduleSync(f.tripId);
         closeSheet();
         render();
       },
     });
   },
   async 'del-file'(el) {
-    const f = S.files.find((x) => x.id === el.dataset.file);
+    const f = anyFile(el.dataset.file);
     closeSheet();
     if (!(await confirmBox('Delete this ticket?'))) return;
     closeSheet();
     await db.del('files', f.id);
+    if (f.tripId === DOCS) {
+      S.docFiles = S.docFiles.filter((x) => x.id !== f.id);
+      toast('File deleted');
+      go(`doc/${f.itemId}`);
+      return;
+    }
     S.files = S.files.filter((x) => x.id !== f.id);
+    const t = trip();
+    tombstone(t, f.id);
+    await saveTrip(t, { quiet: true });
     toast('Ticket deleted');
-    go(`item/${f.itemId}`);
+    go(f.itemId.startsWith('j_') ? `journal/${t.journal.find((j) => j.id === f.itemId)?.date || ''}` : `item/${f.itemId}`);
   },
   async 'toggle-todo'(el) {
     const t = trip();
@@ -1405,7 +2237,7 @@ const ACT = {
 async function doBackup(share) {
   const trips = await db.getAll('trips');
   const files = await db.getAll('files');
-  const json = await exportBundle('backup', trips, files);
+  const json = await exportBundle('backup', trips, files, { docs: S.docs });
   const blob = new Blob([json], { type: 'application/json' });
   const name = `travel-pack-backup-${isoDate(new Date())}.json`;
   const ok = share ? await shareOrDownload(name, blob, 'Travel Pack backup') : (download(name, blob), true);
@@ -1555,12 +2387,253 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
 }
 
 /* =====================================================================
+   Actions for documents, journal, sync, email and AI
+   ===================================================================== */
+
+Object.assign(ACT, {
+  'doc-sheet': (el) => docSheet(S.docs.find((d) => d.id === el.dataset.id)),
+  'add-doc-files': (el) => { pendingDoc = el.dataset.id; fileInput.click(); },
+  async 'del-doc'(el) {
+    const d = S.docs.find((x) => x.id === el.dataset.id);
+    if (!(await confirmBox(`Delete “${d.title}” and its photos?`))) return;
+    closeSheet();
+    for (const f of S.docFiles.filter((x) => x.itemId === d.id)) await db.del('files', f.id);
+    S.docFiles = S.docFiles.filter((x) => x.itemId !== d.id);
+    S.docs = S.docs.filter((x) => x.id !== d.id);
+    await saveDocs();
+    go('docs');
+  },
+
+  'journal-edit': (el) => {
+    const t = trip();
+    const j = t.journal.find((x) => x.id === el.dataset.id);
+    openSheet({
+      title: 'Edit entry',
+      body: html`<label class="fld"><span>Entry</span><textarea name="text" rows="6">${j.text || ''}</textarea></label>`,
+      extra: html`<button type="button" class="btn danger-ghost" data-act="journal-del" data-id="${j.id}">Delete</button>`,
+      onSubmit: async (fd) => { j.text = String(fd.get('text') || '').trim(); closeSheet(); await saveTrip(t); },
+    });
+  },
+  async 'journal-del'(el) {
+    const t = trip();
+    closeSheet();
+    if (!(await confirmBox('Delete this entry and its photos?'))) return;
+    closeSheet();
+    for (const f of S.files.filter((x) => x.itemId === el.dataset.id)) { await db.del('files', f.id); tombstone(t, f.id); }
+    S.files = S.files.filter((x) => x.itemId !== el.dataset.id);
+    t.journal = t.journal.filter((x) => x.id !== el.dataset.id);
+    await saveTrip(t);
+  },
+
+  async 'connect-confirm'() {
+    const c = S.incomingConnect;
+    S.incomingConnect = null;
+    await setServer(c);
+    if (!S.me) { S.me = c.name.charAt(0).toUpperCase() + c.name.slice(1); await db.put('meta', S.me, 'me'); }
+    toast(`Connected as ${c.name}`);
+    go('sync');
+    refreshAccount();
+    loadServerTrips();
+  },
+  'connect-cancel': () => { S.incomingConnect = null; },
+  async disconnect() {
+    if (!(await confirmBox('Disconnect this phone from the server? Trips stay on the phone; live sharing, email and the assistant stop.', 'Disconnect'))) return;
+    closeSheet();
+    await setServer(null);
+    S.account = null;
+    S.synced = {};
+    await db.put('meta', S.synced, 'synced');
+    await db.del('meta', 'account');
+    go('more');
+  },
+  async 'sync-on'() {
+    const t = trip();
+    S.synced[t.id] = { rev: 0, at: '' };
+    await db.put('meta', S.synced, 'synced');
+    render();
+    await syncTrip(t.id);
+    toast(S.sync.state === 'error' ? `Not shared yet: ${S.sync.error}` : 'Shared live');
+    loadServerTrips();
+  },
+  'sync-now': () => syncTrip(S.tripId).then(() => { render(); toast(S.sync.state === 'error' ? S.sync.error : 'Up to date'); }),
+  'sync-off': () => {
+    openSheet({
+      title: 'Stop sharing this trip?', submit: '',
+      body: html`<p>This phone keeps its copy and stops sending and receiving changes.</p>`,
+      extra: html`<button type="button" class="btn danger-ghost" data-act="sync-remove">Also remove from server</button><button type="button" class="btn primary" data-act="sync-stop">Stop on this phone</button>`,
+    });
+  },
+  async 'sync-stop'() {
+    delete S.synced[S.tripId];
+    await db.put('meta', S.synced, 'synced');
+    closeSheet();
+    render();
+  },
+  async 'sync-remove'() {
+    try { await api(`/api/trips/${encodeURIComponent(S.tripId)}`, { method: 'DELETE' }); } catch (e) { toast(e.message); return; }
+    delete S.synced[S.tripId];
+    await db.put('meta', S.synced, 'synced');
+    closeSheet();
+    loadServerTrips();
+    toast('Removed from the server');
+  },
+  async 'pull-trip'(el) {
+    try {
+      const { trip: t, rev } = await api(`/api/trips/${encodeURIComponent(el.dataset.id)}`);
+      await storeTrip(t);
+      S.synced[t.id] = { rev, at: new Date().toISOString() };
+      await db.put('meta', S.synced, 'synced');
+      await setCurrentTrip(t.id);
+      toast('Downloading tickets…');
+      await syncFiles(t.id, t);
+      await loadFiles();
+      toast(`${t.name} is on this phone`);
+      go('today');
+    } catch (e) { toast(e.message); }
+  },
+
+  async 'gmail-connect'() {
+    try {
+      const { url } = await api('/api/gmail/start');
+      location.href = url;
+    } catch (e) { toast(e.message); }
+  },
+  'email-chip': (el) => emailSearch(el.dataset.q),
+  'ai-email': (el) => runExtract('/api/ai/extract-email', { messageId: el.dataset.id }, 'email'),
+  'mail-save': (el) => {
+    const t = trip();
+    const items = [...t.items].sort((a, b) => (a.date + (a.time || '')).localeCompare(b.date + (b.time || '')));
+    openSheet({
+      title: `Save “${el.dataset.name}”`,
+      body: html`<label class="fld"><span>Booking</span><select name="itemId">${items.map((it) => html`<option value="${it.id}">${fmtDay(it.date)} · ${itemTitle(it)}</option>`)}</select></label>`,
+      submit: 'Save as ticket',
+      onSubmit: async (fd) => {
+        closeSheet();
+        try {
+          const res = await api(`/api/gmail/messages/${encodeURIComponent(el.dataset.msg)}/attachments/${encodeURIComponent(el.dataset.att)}?type=${encodeURIComponent(el.dataset.type)}`, { raw: true, timeout: 120000 });
+          const blob = new Blob([await res.arrayBuffer()], { type: el.dataset.type });
+          await addFiles(String(fd.get('itemId')), [new File([blob], el.dataset.name, { type: el.dataset.type })]);
+        } catch (e) { toast(e.message); }
+      },
+    });
+  },
+
+  'ai-sheet': () => {
+    openSheet({
+      title: 'Add from an email, PDF or screenshot',
+      body: html`<label class="fld"><span>Paste the email or booking text</span><textarea name="text" rows="6" placeholder="Paste here…"></textarea></label>
+        <label class="fld"><span>…and/or add screenshots or PDFs</span><input type="file" name="files" accept="image/*,application/pdf" multiple></label>
+        ${S.account?.gmail?.connected ? html`<a class="btn ghost" href="#/email">${icon('message')} Or search Gmail</a>` : ''}`,
+      submit: 'Read with Claude',
+      onSubmit: async (fd) => {
+        const text = String(fd.get('text') || '').trim();
+        const files = fd.getAll('files').filter((f) => f && f.size);
+        if (!text && !files.length) { toast('Paste some text or add a file first.'); return false; }
+        closeSheet();
+        const attachments = await attachmentsFrom(files);
+        runExtract('/api/ai/extract', { text, attachments, source: files.length ? 'document' : 'text' }, files.length ? 'document' : 'text');
+      },
+    });
+  },
+  async 'inbox-ai'(el) {
+    const f = S.inbox.find((x) => x.id === el.dataset.id);
+    if (f.text) return runExtract('/api/ai/extract', { text: `${f.name}\n\n${f.text}`, source: 'shared text' }, 'text');
+    runExtract('/api/ai/extract', { attachments: await attachmentsFrom([f.blob]), source: 'document' }, 'document');
+  },
+  async 'ai-apply'(el) {
+    const p = S.ai.items[Number(el.dataset.i)];
+    applyAi(p);
+    p.state = 'done';
+    await saveTrip(trip());
+    toast(p.existingId ? 'Booking updated' : 'Booking added');
+  },
+  async 'ai-apply-all'() {
+    for (const p of S.ai.items) if (p.state === 'pending' && p.item.date) { applyAi(p); p.state = 'done'; }
+    await saveTrip(trip());
+    toast('Added');
+  },
+  'ai-skip': (el) => { S.ai.items[Number(el.dataset.i)].state = 'skipped'; render(); },
+  'ai-edit': (el) => {
+    const p = S.ai.items[Number(el.dataset.i)];
+    const t = trip();
+    const cur = p.existingId ? t.items.find((x) => x.id === p.existingId) : null;
+    p.state = 'done';
+    S.draft = cur ? { ...structuredClone(cur), ...p.item, id: cur.id } : { ...blankItem(p.item.type || 'other', p.item.date || defaultDate(t)), ...p.item };
+    go(cur ? `edit/${cur.id}` : `new/${S.draft.type}`);
+  },
+
+  'chat-suggest': (el) => askAssistant(el.dataset.q),
+  async 'chat-clear'() {
+    const t = trip();
+    S.chat[t.id] = [];
+    await db.put('meta', [], 'chat:' + t.id);
+    render();
+  },
+  async 'chat-apply'(el) {
+    const t = trip();
+    const msgs = S.chat[t.id];
+    const c = msgs[Number(el.dataset.m)].changes[Number(el.dataset.c)];
+    if (c.action === 'delete') {
+      t.items = t.items.filter((x) => x.id !== c.itemId);
+    } else if (c.action === 'update' && t.items.some((x) => x.id === c.itemId)) {
+      const cur = t.items.find((x) => x.id === c.itemId);
+      putItem(t, { ...structuredClone(cur), ...fromAi(c.item), id: cur.id });
+    } else {
+      putItem(t, { id: uid('it_'), people: [], status: 'confirmed', ...fromAi(c.item) });
+    }
+    c.state = 'applied';
+    await db.put('meta', msgs, 'chat:' + t.id);
+    await saveTrip(t);
+    toast('Done');
+  },
+  async 'chat-dismiss'(el) {
+    const t = trip();
+    S.chat[t.id][Number(el.dataset.m)].changes[Number(el.dataset.c)].state = 'dismissed';
+    await db.put('meta', S.chat[t.id], 'chat:' + t.id);
+    render();
+  },
+});
+
+Object.assign(FORMS, {
+  async journal(fd) {
+    const t = trip();
+    const text = String(fd.get('text') || '').trim();
+    if (!text) return;
+    t.journal = t.journal || [];
+    t.journal.push({ id: uid('j_'), date: String(fd.get('date')), text, author: S.me || getServer()?.name || '', at: new Date().toISOString() });
+    await saveTrip(t);
+  },
+  'email-search': (fd) => emailSearch(String(fd.get('q') || '').trim()),
+  ask(fd, form) {
+    const q = String(fd.get('q') || '').trim();
+    if (q) askAssistant(q);
+    form.reset();
+  },
+});
+
+async function loadServerTrips() {
+  if (!getServer() || !navigator.onLine) return;
+  try { S.serverTrips = await api('/api/trips'); } catch { S.serverTrips = []; }
+  if (S.route.name === 'sync') render();
+}
+
+// Keep shared trips fresh while the app is open.
+setInterval(() => {
+  if (document.visibilityState === 'visible' && navigator.onLine && S.tripId && S.synced[S.tripId]) syncTrip(S.tripId);
+}, 45000);
+window.addEventListener('online', () => { if (S.tripId && S.synced[S.tripId]) syncTrip(S.tripId); refreshAccount(); });
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && S.tripId && S.synced[S.tripId]) syncTrip(S.tripId);
+});
+
+/* =====================================================================
    Boot
    ===================================================================== */
 
 (async function boot() {
   try {
     await loadAll();
+    S.account = (await db.get('meta', 'account')) || null;
     if (navigator.storage?.persisted) S.persisted = await navigator.storage.persisted();
     await refreshInbox();
   } catch (e) {
@@ -1569,6 +2642,8 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
     return;
   }
   await onRoute();
+  refreshAccount();
+  if (S.tripId && S.synced[S.tripId]) syncTrip(S.tripId);
   if (S.inbox.length && S.route.name !== 'inbox') toast(`${S.inbox.length} shared file${S.inbox.length === 1 ? '' : 's'} waiting`, { act: 'goto-inbox', label: 'Attach' });
 })();
 

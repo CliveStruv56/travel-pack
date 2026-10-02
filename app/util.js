@@ -87,19 +87,20 @@ export function fmtDuration(ms) {
   return `${m}m`;
 }
 
-/** "in 3h 12m", "in 2 days", "now", "12m ago" */
+/** "in 3h 12m", "tomorrow at 12:00", "Mon at 09:45", "in 9 days", "12m ago" */
 export function fmtUntil(target, now) {
   const ms = target - now;
   if (Math.abs(ms) < 60000) return 'now';
-  const future = ms > 0;
-  const mins = Math.abs(ms) / 60000;
-  let txt;
-  if (mins < 60 * 24) txt = fmtDuration(Math.abs(ms));
-  else {
-    const days = Math.round(mins / 60 / 24);
-    txt = `${days} day${days === 1 ? '' : 's'}`;
+  if (ms < 0) {
+    const mins = -ms / 60000;
+    return mins < 60 * 24 ? `${fmtDuration(-ms)} ago` : `${Math.round(mins / 1440)} day${Math.round(mins / 1440) === 1 ? '' : 's'} ago`;
   }
-  return future ? `in ${txt}` : `${txt} ago`;
+  const days = daysBetween(isoDate(now), isoDate(target));
+  if (days === 0) return `in ${fmtDuration(ms)}`;
+  const at = `${String(target.getHours()).padStart(2, '0')}:${String(target.getMinutes()).padStart(2, '0')}`;
+  if (days === 1) return ms < 6 * 3600000 ? `in ${fmtDuration(ms)}` : `tomorrow at ${at}`;
+  if (days < 7) return `${target.toLocaleDateString('en-GB', { weekday: 'short' })} at ${at}`;
+  return `in ${days} days`;
 }
 
 /* ---------- money ---------- */

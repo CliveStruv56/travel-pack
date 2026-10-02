@@ -104,13 +104,13 @@ export function shareText(trip, opts) {
 
 /* ---------- files ---------- */
 
-export async function exportBundle(kind, trips, files) {
+export async function exportBundle(kind, trips, files, extra = {}) {
   const outFiles = [];
   for (const f of files) {
     const { blob, ...meta } = f;
     outFiles.push({ ...meta, data: await blobToBase64(blob) });
   }
-  return JSON.stringify({ format: 'travel-pack', version: 1, kind, exportedAt: new Date().toISOString(), trips, files: outFiles });
+  return JSON.stringify({ format: 'travel-pack', version: 1, kind, exportedAt: new Date().toISOString(), trips, files: outFiles, ...extra });
 }
 
 export function parseBundle(text) {

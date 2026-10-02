@@ -5,7 +5,11 @@
 import { chromium, devices } from 'playwright';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
+import { createServer } from 'node:http';
 import { start } from '../tools/serve.mjs';
+import { createApp } from '../server/index.mjs';
+import { openDb } from '../server/db.mjs';
+import * as ai from '../server/ai.mjs';
 
 const PORT = 5199;
 const BASE = `http://localhost:${PORT}/`;
@@ -24,11 +28,38 @@ function ok(cond, name) {
   else { failed++; console.log('  ✗ ' + name); }
 }
 
+// Open-Meteo stand-in: Sanday gets a gale at 15:00 on 8 May 2030, everywhere else is calm.
+function fakeWeather(route) {
+  const u = new URL(route.request().url());
+  if (u.hostname.startsWith('geocoding')) {
+    const name = u.searchParams.get('name');
+    const lat = name === 'Sanday' ? 59.25 : 52 + (name.length % 5);
+    return route.fulfill({ json: { results: [{ name, latitude: lat, longitude: -2.5 }] } });
+  }
+  const lat = Number(u.searchParams.get('latitude'));
+  const time = [], gusts = [], days = [];
+  for (let d = 0; d < 16; d++) {
+    const day = new Date(Date.UTC(2030, 4, 8 + d)).toISOString().slice(0, 10);
+    days.push(day);
+    for (let h = 0; h < 24; h++) {
+      time.push(`${day}T${String(h).padStart(2, '0')}:00`);
+      gusts.push(lat === 59.25 && d === 0 && h === 15 ? 56 : 14);
+    }
+  }
+  const n = time.length;
+  return route.fulfill({ json: {
+    hourly: { time, wind_gusts_10m: gusts, wind_speed_10m: gusts.map((g) => Math.round(g * 0.6)), temperature_2m: Array(n).fill(12), weather_code: Array(n).fill(3), precipitation_probability: Array(n).fill(20), visibility: Array(n).fill(20000) },
+    daily: { time: days, weather_code: days.map(() => 3), temperature_2m_max: days.map(() => 14), temperature_2m_min: days.map(() => 8), precipitation_probability_max: days.map(() => 30), wind_gusts_10m_max: days.map(() => 30) },
+  } });
+}
+
 async function phone(opts = {}) {
   const ctx = await browser.newContext({ ...devices['Pixel 7'], acceptDownloads: true, ...opts });
+  await ctx.route(/open-meteo\.com/, fakeWeather);
   const page = await ctx.newPage();
   page.on('pageerror', (e) => errors.push(e.message));
-  page.on('console', (m) => m.type() === 'error' && errors.push(m.text()));
+  // Expected 4xx answers from the server show up as resource errors; real failures fail an assertion instead.
+  page.on('console', (m) => m.type() === 'error' && !m.text().startsWith('Failed to load resource: the server responded') && errors.push(m.text()));
   return { ctx, page };
 }
 
@@ -208,6 +239,208 @@ await section('Add-booking link adds to the existing trip', async () => {
   await p.goto(`${BASE}#add=garbage`);
   await p.waitForTimeout(300);
   ok(!(await p.$('.add-card')), 'a broken link is rejected');
+});
+
+
+await section('Editing: add from a day, change status, undo a delete', async () => {
+  await p.goto(at('2030-05-08T12:00', 'plan'));
+  await p.click('#day-2030-05-12 [data-act=new-item]');
+  await p.click('.sheet-panel [data-act=pick-type][data-type=other]');
+  await p.waitForSelector('form[data-form=item]');
+  ok((await p.inputValue('input[name=date]')) === '2030-05-12', 'Add under a day starts on that day');
+  await p.fill('input[name=title]', 'Lunch with Jane');
+  await p.click('button[type=submit]');
+  await p.waitForSelector('.d-head');
+  ok(!!(await p.$('.d-quick a.btn.primary[href^="#/edit/"]')), 'booking page has a clear Edit button');
+  await p.click('[data-act=status-sheet]');
+  await p.click('.sheet-panel [data-status=arranged]');
+  await p.waitForTimeout(150);
+  ok((await p.textContent('.d-head .chip')).includes('Arranged'), 'status changed from the booking page');
+  const id = p.url().split('/').pop();
+  await p.click('.d-actions [data-act=del-item]');
+  await p.click('.sheet-panel .btn.primary');
+  await p.waitForSelector('#toast.show button');
+  ok(!(await p.evaluate((x) => window.__tp.S.trips[0].items.some((i) => i.id === x), id)), 'deleted');
+  await p.click('#toast button');
+  await p.waitForTimeout(200);
+  ok(await p.evaluate((x) => window.__tp.S.trips[0].items.some((i) => i.id === x), id), 'Undo restores it');
+});
+
+await section('Weather and Plan B', async () => {
+  await p.goto(at('2030-05-08T09:00', 'plan'));
+  await p.waitForSelector('#day-2030-05-08 .risk', { timeout: 8000 });
+  ok((await p.textContent('#day-2030-05-08 .t-flight .risk')).includes('gusts 56 mph at Sanday'), 'island flight flagged for gusts');
+  ok(!!(await p.$('#day-2030-05-08 .wx')), 'day shows a forecast chip');
+  await p.goto(at('2030-05-08T09:00', 'today'));
+  await p.waitForSelector('.hero-wrap .banner');
+  ok((await p.textContent('.hero-wrap .banner')).includes('likely to disrupt'), 'Today warns on the next leg');
+  await p.goto(at('2030-05-08T09:00', 'edit/it_lm0710'));
+  ok(await p.isChecked('input[name=weatherSensitive]'), 'island flight is weather-sensitive by default');
+  await p.fill('textarea[name=planB]', 'Orkney Ferries from Sanday; NorthLink sails 23:45 so there is slack.');
+  await p.click('button[type=submit]');
+  await p.waitForSelector('.planb');
+  ok((await p.textContent('.planb')).includes('Orkney Ferries'), 'Plan B shows on the booking');
+  await shot(p, '06-weather-planb');
+});
+
+await section('Documents', async () => {
+  await p.goto(at('2030-05-08T12:00', 'tickets'));
+  await p.click('.seg-tabs a[href="#/docs"]');
+  await p.click('[data-act=doc-sheet]');
+  await p.selectOption('.sheet-panel select[name=category]', 'passport');
+  await p.fill('.sheet-panel input[name=title]', 'UK passport');
+  await p.fill('.sheet-panel input[name=number]', '123456789');
+  await p.fill('.sheet-panel input[name=expiry]', '2030-12-01');
+  await p.click('.sheet-panel .btn.primary');
+  await p.waitForSelector('.d-head');
+  ok((await p.textContent('.d-head')).includes('Expires'), 'expiry within six months is flagged');
+  await p.click('[data-act=add-doc-files]');
+  await p.setInputFiles('#file-input', OUT + 'fake-pass.png');
+  await p.waitForSelector('.thumb:not(.add)');
+  await p.click('.thumb:not(.add)');
+  await p.waitForSelector('.viewer');
+  ok((await p.textContent('.v-title')).includes('UK passport'), 'document photo opens in the viewer');
+  await p.goto(at('2030-05-08T12:00', 'docs'));
+  ok((await p.textContent('.page')).includes('•••• 6789'), 'list shows only the last digits');
+});
+
+await section('Journal', async () => {
+  await p.goto(at('2030-05-09T20:00', 'today'));
+  await p.click('a.tip[href^="#/journal/"]');
+  await p.waitForSelector('form[data-form=journal]');
+  await p.fill('form[data-form=journal] textarea', 'Fish supper by the harbour.');
+  await p.click('form[data-form=journal] button');
+  await p.waitForSelector('.journal-entry');
+  ok((await p.textContent('.journal-entry')).includes('Fish supper'), 'entry saved');
+  await p.click('.journal-entry [data-act=add-files]');
+  await p.setInputFiles('#file-input', OUT + 'fake-pass.png');
+  await p.waitForSelector('.journal-entry .thumb:not(.add)');
+  ok(true, 'photo added to the entry');
+});
+
+await section('Server: live sharing between two phones, AI, Gmail', async () => {
+  // A fake Google for the sign-in round trip and the Gmail API.
+  const g = createServer(async (req, res) => {
+    const u = new URL(req.url, 'http://x');
+    const json = (o) => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(o)); };
+    if (u.pathname === '/auth') { res.writeHead(302, { Location: `${process.env.PUBLIC_URL}/api/gmail/callback?code=good&state=${encodeURIComponent(u.searchParams.get('state'))}` }); return res.end(); }
+    if (u.pathname === '/token') return json({ access_token: 'at', refresh_token: 'rt', expires_in: 3600 });
+    if (u.pathname === '/gmail/profile') return json({ emailAddress: 'traveller@example.com' });
+    if (u.pathname === '/gmail/messages') return json({ messages: [{ id: 'm1' }] });
+    if (u.pathname === '/gmail/messages/m1' && u.searchParams.get('format') === 'metadata') return json({ id: 'm1', internalDate: '1890000000000', snippet: 'Your booking SMP777', payload: { headers: [{ name: 'Subject', value: 'Booking confirmed' }, { name: 'From', value: 'Sample Hotels <x@example.com>' }] } });
+    if (u.pathname === '/gmail/messages/m1') return json({ id: 'm1', internalDate: '1890000000000', payload: { mimeType: 'text/plain', headers: [{ name: 'Subject', value: 'Booking confirmed' }], body: { data: Buffer.from('Booking SMP777 for 15 May 2030').toString('base64url') } } });
+    res.writeHead(404); res.end();
+  });
+  await new Promise((r) => g.listen(0, r));
+  const gu = `http://localhost:${g.address().port}`;
+  const srvHttp = createServer();
+  await new Promise((r) => srvHttp.listen(0, r));
+  const SRV = `http://localhost:${srvHttp.address().port}`;
+  Object.assign(process.env, { GOOGLE_CLIENT_ID: 'c', GOOGLE_CLIENT_SECRET: 's', PUBLIC_URL: SRV, GOOGLE_AUTH_URL: `${gu}/auth`, GOOGLE_TOKEN_URL: `${gu}/token`, GMAIL_API_BASE: `${gu}/gmail`, ANTHROPIC_API_KEY: 'test' });
+  const item = { type: 'hotel', status: 'confirmed', title: 'Sample Harbour Hotel', provider: '', number: '', from: '', to: '', fromCode: '', toCode: '', date: '2030-05-15', time: '15:00', endDate: '2030-05-16', endTime: '11:00', seat: '', class: '', ref: 'SMP777', eticket: '', address: '', phone: '', keyTimes: '', notes: '', planB: '', costAmount: 80, costStatus: 'paid', costNote: '' };
+  ai.setClient({ beta: { messages: { create: async (params) => {
+    const chat = params.output_config.format.schema.properties.reply;
+    const out = chat
+      ? { reply: 'Your flight leaves Sanday at 15:50. I can move your seat.', changes: [{ action: 'update', itemId: 'it_lm0710', reason: 'Seat change', item: { ...item, type: 'flight', title: '', provider: 'Loganair', number: 'LM0710', from: 'Sanday', to: 'Kirkwall', date: '2030-05-08', time: '15:50', endDate: '2030-05-08', endTime: '16:11', seat: '1A', ref: 'SMP001', costAmount: 0, costStatus: 'none' } }] }
+      : { summary: 'One hotel booking.', items: [{ updatesExistingId: '', item }] };
+    return { stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify(out) }] };
+  } } } });
+  const app = createApp({ db: openDb(':memory:'), users: 'clive:tok-clive,jane:tok-jane', secret: 'x', origins: BASE.replace(/\/$/, ''), appUrl: `${BASE}?now=2030-05-08T12:00` });
+  srvHttp.on('request', app.handle);
+  const link = (name, tok) => execFileSync('node', [new URL('../tools/make-connect-link.mjs', import.meta.url).pathname, `${BASE}?now=2030-05-08T12:00`, SRV, name, tok]).toString().trim();
+
+  // Clive connects and shares the trip.
+  await p.goto(link('clive', 'tok-clive'));
+  await p.click('[data-act=connect-confirm]');
+  await p.waitForSelector('[data-act=sync-on]');
+  await p.click('[data-act=sync-on]');
+  await p.waitForFunction(() => window.__tp.S.sync.state === 'ok', null, { timeout: 15000 });
+  await p.goto(at('2030-05-08T12:00', 'today'));
+  ok(!!(await p.$('.pill.sync.ok')), 'Clive shares the trip live; the top bar says so');
+
+  // Jane connects on her own phone and downloads it, tickets included.
+  const { ctx: cj, page: j } = await phone();
+  await j.goto(link('jane', 'tok-jane'));
+  await j.click('[data-act=connect-confirm]');
+  await j.waitForSelector('[data-act=pull-trip]', { timeout: 10000 });
+  await j.click('[data-act=pull-trip]');
+  await j.waitForSelector('.hero-wrap', { timeout: 15000 });
+  const janeFiles = await j.evaluate(() => window.__tp.S.files.length);
+  ok(janeFiles >= 2, `Jane gets the trip with its tickets and photos (${janeFiles} files)`);
+  ok(await j.evaluate(() => window.__tp.S.trips[0].items.some((i) => i.ref === 'TESTREF1')), "Clive's edits are in Jane's copy");
+
+  // Jane changes a booking; Clive sees it after a sync.
+  await j.goto(at('2030-05-08T12:00', 'edit/it_lm0706'));
+  await j.fill('input[name=seat]', '3C');
+  await j.click('button[type=submit]');
+  await j.waitForSelector('.d-head');
+  await j.waitForTimeout(2500);
+  await p.evaluate(() => window.__tp.S.synced && null);
+  await p.goto(at('2030-05-08T12:00', 'sync'));
+  await p.click('[data-act=sync-now]');
+  await p.waitForTimeout(800);
+  ok(await p.evaluate(() => window.__tp.S.trips[0].items.find((i) => i.id === 'it_lm0706')?.seat === '3C'), "Jane's change reaches Clive");
+
+  // Both edit different bookings at once: both changes survive.
+  await p.evaluate(async () => { const t = window.__tp.S.trips[0]; t.items.find((i) => i.id === 'it_lner').seat = 'Coach L 1'; });
+  await p.goto(at('2030-05-08T12:00', 'edit/it_lner'));
+  await p.fill('input[name=seat]', 'Coach L 1');
+  await p.click('button[type=submit]');
+  await j.goto(at('2030-05-08T12:00', 'edit/it_tpe'));
+  await j.fill('input[name=seat]', 'Coach E 2');
+  await j.click('button[type=submit]');
+  await p.waitForTimeout(3000);
+  await p.goto(at('2030-05-08T12:00', 'sync')); await p.click('[data-act=sync-now]'); await p.waitForTimeout(800);
+  await j.goto(at('2030-05-08T12:00', 'sync')); await j.click('[data-act=sync-now]'); await j.waitForTimeout(800);
+  const seats = (pg) => pg.evaluate(() => window.__tp.S.trips[0].items.filter((i) => ['it_lner', 'it_tpe'].includes(i.id)).map((i) => i.seat).join('/'));
+  ok((await seats(p)) === 'Coach L 1/Coach E 2' && (await seats(j)) === 'Coach L 1/Coach E 2', 'simultaneous edits on two phones both survive');
+  await cj.close();
+
+  // AI: paste an email, review, add.
+  await p.goto(at('2030-05-08T12:00', 'plan'));
+  await p.click('.fab');
+  await p.click('.sheet-panel [data-act=ai-sheet]');
+  await p.fill('.sheet-panel textarea[name=text]', 'Your booking SMP777 at Sample Harbour Hotel, 15 May 2030.');
+  await p.click('.sheet-panel .btn.primary');
+  await p.waitForSelector('.ai-card', { timeout: 10000 });
+  ok((await p.textContent('.ai-card')).includes('SMP777'), 'Claude’s reading is shown for checking');
+  await shot(p, '07-ai-review');
+  await p.click('[data-act=ai-apply]');
+  await p.waitForTimeout(200);
+  ok(await p.evaluate(() => window.__tp.S.trips[0].items.some((i) => i.ref === 'SMP777' && i.cost?.amount === 80)), 'booking added with its cost');
+
+  // Ask: a question, and a proposed change that is only applied on approval.
+  await p.goto(at('2030-05-08T12:00', 'ask'));
+  await p.waitForSelector('form[data-form=ask]');
+  await p.fill('form[data-form=ask] textarea', 'When does my flight leave? Put me in seat 1A.');
+  await p.click('form[data-form=ask] button');
+  await p.waitForSelector('.bubble.assistant .change', { timeout: 10000 });
+  ok((await p.textContent('.bubble.assistant')).includes('15:50'), 'assistant answers');
+  ok(await p.evaluate(() => window.__tp.S.trips[0].items.find((i) => i.id === 'it_lm0710').seat !== '1A'), 'nothing changes before approval');
+  await p.click('[data-act=chat-apply]');
+  await p.waitForTimeout(200);
+  ok(await p.evaluate(() => window.__tp.S.trips[0].items.find((i) => i.id === 'it_lm0710').seat === '1A'), 'change applied after approval');
+  await shot(p, '08-ask');
+
+  // Gmail: connect, search, open, create a booking from the email.
+  await p.goto(at('2030-05-08T12:00', 'email'));
+  await p.click('[data-act=gmail-connect]');
+  await p.waitForSelector('.mail-row', { timeout: 10000 });
+  ok((await p.textContent('.mail-row')).includes('Booking confirmed'), 'Gmail connected and recent bookings listed');
+  await p.click('.mail-row');
+  await p.waitForSelector('.mail-body');
+  ok((await p.textContent('.mail-body')).includes('SMP777'), 'email opens');
+  await p.click('[data-act=ai-email]');
+  await p.waitForSelector('.ai-card', { timeout: 10000 });
+  ok(true, 'bookings created from the email for review');
+
+  // Disconnect before the server goes away, so later sections run offline-from-server.
+  await p.goto(at('2030-05-08T12:00', 'sync'));
+  await p.click('[data-act=disconnect]');
+  await p.click('.sheet-panel .btn.primary');
+  await p.waitForTimeout(200);
+  ok(!(await p.$('.pill.sync')), 'disconnecting stops sharing on this phone');
+  srvHttp.close(); g.close();
 });
 
 await section('Backup and restore', async () => {

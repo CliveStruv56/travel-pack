@@ -22,6 +22,18 @@ It has no server, no account and no third-party code.
 - **Backup and restore:** everything, tickets included, in one file.
 - **Several trips:** keep past trips and reuse the app for the next one.
 
+### With the server (optional, see [docs-server.md](docs-server.md))
+- **Live sharing** with Jane (or anyone you connect). Both can edit; tickets, journal and photos sync too.
+- **Add from email, PDF or screenshot**: Claude reads it and fills in the booking for you to check.
+- **Search Gmail** inside the app (read-only), then turn an email into bookings in one tap.
+- **Ask Travel Pack**: questions about the trip, or changes in plain English, each one approved by you.
+
+### Also
+- **Documents**: passport, insurance, railcard, with expiry warnings. They stay on the phone and are never synced.
+- **Journal**: a few lines and photos for each day.
+- **Weather & Plan B**: forecasts for each day. Island flights and ferries are flagged when gusts or fog could
+  disrupt them, with your Plan B shown alongside.
+
 ## Install on your phone
 1. Open the live app in Chrome on Android, then ⋮ → **Install app**.
 2. Load a trip: open a setup link (see below) and tap **Save to this phone**, or use **Import a trip file**.
@@ -33,7 +45,7 @@ git clone https://github.com/CliveStruv56/travel-pack && cd travel-pack
 npm install                      # only dev dependency: Playwright
 npx playwright install chromium  # once
 npm start                        # http://localhost:5173
-npm test                         # static checks + 44 browser tests (Pixel 7 size)
+npm test                         # static checks, server tests, 80 browser tests (Pixel 7 size)
 npm run test:shots               # same, saving screenshots to test-results/
 ```
 - Add `?now=2030-05-09T15:30` (any date and time) to the URL to see the app as it will look at that moment.
