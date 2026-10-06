@@ -23,7 +23,7 @@ It has no server, no account and no third-party code.
 - **Several trips:** keep past trips and reuse the app for the next one.
 
 ### With the server (optional, see [docs-server.md](docs-server.md))
-- **Live sharing** with Jane (or anyone you connect). Both can edit; tickets, journal and photos sync too.
+- **Live sharing** by invite: Share → Create invite link, send it to Jane, she taps Join and the trip installs on her phone. Both can edit; tickets, journal and photos sync too (personal documents never do).
 - **Add from email, PDF or screenshot**: Claude reads it and fills in the booking for you to check.
 - **Search Gmail** inside the app (read-only), then turn an email into bookings in one tap.
 - **Ask Travel Pack**: questions about the trip, or changes in plain English, each one approved by you.

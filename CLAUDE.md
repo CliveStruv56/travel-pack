@@ -35,5 +35,7 @@ bookings and ticket barcodes on an Android phone. See README.md for features and
   - **AI output is never applied without a tap.** Extraction goes to a review screen; chat changes need Apply. Tests assert this.
   - The model is `claude-opus-5-5`, called through the official SDK with structured outputs and `fallbacks: "default"`.
     `server/sdk.test.mjs` checks the real SDK's wire format in CI.
+  - Access: `USERS` owners see every trip; invited members (one-time `#join=` codes, `/api/invites/redeem`) see only
+    their trips. Every trip and file route checks `canSee`; `server.test.mjs` asserts the scoping.
   - Documents (`tripId: '__docs'`) are personal and never synced. Secrets live only in server environment variables.
 - Deploy is `.github/workflows/ci.yml`: tests on every push and PR, then GitHub Pages from `main`.

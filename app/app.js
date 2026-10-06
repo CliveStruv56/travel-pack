@@ -7,7 +7,7 @@ import {
 } from './model.js';
 import { tripToIcs, googleCalendarUrl } from './ics.js';
 import { shareLink, readShareLink, readAddLink, shareText, exportBundle, parseBundle } from './share.js';
-import { api, loadServer, getServer, setServer, readConnectLink } from './api.js';
+import { api, loadServer, getServer, setServer, readConnectLink, joinLink, readJoinLink, redeemInvite } from './api.js';
 import { stampChanges, tombstone, mergeTrips, forServer, sameContent } from './merge.js';
 import { geocode, forecast, daily, hourly, legRisk, isWeatherSensitive, describeCode } from './weather.js';
 
@@ -38,6 +38,9 @@ const S = {
   sync: { state: 'idle', error: '' },
   account: null,        // what the server says about this phone's user (/api/me)
   incomingConnect: null,
+  incomingJoin: null,   // an invite to share a trip live, not yet accepted
+  invite: null,         // the last invite this phone created { tripId, name, link, expiresAt }
+  installHint: false,   // after joining: show how to put the app on the home screen
   weather: {},          // place name → { geo, data }
   chat: {},             // tripId → [{ role, content, changes }]
   chatBusy: false,
@@ -84,6 +87,7 @@ async function loadAll() {
   S.lastBackup = (await db.get('meta', 'lastBackup')) || null;
   S.synced = (await db.get('meta', 'synced')) || {};
   S.docs = (await db.get('meta', 'docs')) || [];
+  S.installHint = !!(await db.get('meta', 'installHint')) && !isStandalone();
   for (const t of S.trips) S.snap.set(t.id, structuredClone(t));
   await loadServer();
   if (!S.trips.find((t) => t.id === S.tripId)) S.tripId = pickDefaultTrip()?.id || null;
@@ -169,6 +173,15 @@ async function onRoute() {
       history.replaceState(null, '', '#/today');
     }
   }
+  if (location.hash.startsWith('#join=')) {
+    try {
+      S.incomingJoin = readJoinLink(location.hash.slice(1));
+      history.replaceState(null, '', '#/join');
+    } catch {
+      toast('That invite link could not be read. It may have been cut short when it was copied.');
+      history.replaceState(null, '', '#/today');
+    }
+  }
   if (location.hash.startsWith('#add=')) {
     try {
       S.incoming = await readAddLink(location.hash.slice(1));
@@ -183,6 +196,7 @@ async function onRoute() {
   if (S.route.name === 'add' && !S.incoming) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
   if (S.route.name === 'shared' && !S.preview) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
   if (S.route.name === 'sync') { S.serverTrips = null; loadServerTrips(); }
+  if (S.route.name === 'join' && !S.incomingJoin) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
   if (S.route.name === 'connect' && !S.incomingConnect) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
   if (S.route.name === 'inbox') await refreshInbox();
   if (S.route.name === 'email' && /gmail=connected/.test(location.hash)) { toast('Gmail connected'); refreshAccount(); }
@@ -393,6 +407,7 @@ VIEWS.today = (t) => {
   const dueRows = costs(t).rows.filter((it) => it.cost.status === 'due');
   const openTodos = (t.checklist || []).filter((c) => !c.done);
   const noTickets = S.files.length === 0 && !t.readOnly;
+  const install = installCard();
 
   const hero = (m, label, at = m.at) => {
     const it = m.item;
@@ -413,6 +428,7 @@ VIEWS.today = (t) => {
 
   return html`${topBar(t)}<div class="page">
     ${roBanner(t)}
+    ${install}
     ${before ? html`<div class="countdown"><span class="cd-n">${daysBetween(today, t.start)}</span><span class="cd-l">day${daysBetween(today, t.start) === 1 ? '' : 's'} to go<br><small>${fmtLongDay(t.start)}</small></span></div>` : ''}
     ${after ? html`<div class="card done-card">${icon('check')}<div><h3>Trip complete</h3><p>Welcome home. The plan and tickets stay here until you delete the trip.</p></div></div>` : ''}
     ${live ? hero(live, 'On the move · arrives', live.until) : ''}
@@ -821,7 +837,7 @@ VIEWS.more = (t) => {
       ${!ro ? link('#/trip-edit', 'edit', 'Trip details', `${t.name} · ${fmtRange(t.start, t.end)}`) : ''}
       ${link('#/costs', 'coin', 'Costs', c.rows.length ? `${money(c.paid)} paid · ${money(c.due)} to pay${c.unknown ? ` · ${money(c.unknown)} to check` : ''}` : 'No costs recorded')}
       ${link('#/people', 'people', 'People', t.people.length ? t.people.map((p) => p.name).join(', ') : 'Drivers, hosts, family')}
-      ${link('#/share', 'share', 'Share this trip', 'Link for Jane or friends, or a plain-text itinerary')}
+      ${link('#/share', 'share', 'Share this trip', getServer() && !t?.readOnly ? 'Invite Jane or family to share it live, or send a copy' : 'Link for Jane or friends, or a plain-text itinerary')}
       <button class="row" data-act="export-ics"><span class="row-ic">${icon('calendar')}</span><span class="row-main"><b>Add to calendar</b><small>Calendar file with reminders before each departure</small></span>${icon('download', 'sm dim')}</button>
       ${ro ? html`<button class="row" data-act="make-editable"><span class="row-ic">${icon('edit')}</span><span class="row-main"><b>Make an editable copy</b><small>Stops updating from share links</small></span></button>` : ''}
     </div>` : ''}
@@ -911,10 +927,41 @@ VIEWS.people = (t) => {
   </div>`;
 };
 
+function inviteCard(t) {
+  if (t.readOnly) return '';
+  if (!getServer()) {
+    return html`<div class="card tip static">${icon('info')}<div><b>Live sharing needs your server</b><span>Connect this phone first (More → Live sharing). Until then you can send a read-only copy below.</span></div></div>`;
+  }
+  const inv = S.invite?.tripId === t.id ? S.invite : null;
+  return html`<div class="card invite-card">
+    <div class="invite-head"><span class="tile">${icon('people')}</span><div><b>Share live with family</b>
+      <small>They get the whole plan on their own phone: bookings, tickets, contacts, checklist and journal. Edits from either phone appear on both. Your documents (passport, insurance…) are never shared.</small></div></div>
+    ${inv ? html`<div class="invite-ready">
+        <p><b>Invite for ${inv.name} is ready.</b> Send it by WhatsApp, text or email. It works once and expires ${fmtUntil(new Date(inv.expiresAt), new Date())}.</p>
+        <button type="button" class="btn primary wide" data-act="invite-send">${icon('share')} Send invite to ${inv.name}</button>
+        <a class="btn wide" href="${inviteMailto(inv, t)}">${icon('message')} Email it</a>
+        <button type="button" class="btn ghost wide" data-act="invite-copy">${icon('copy')} Copy link</button>
+        <button type="button" class="btn ghost xs" data-act="invite-new">Invite someone else</button>
+      </div>`
+    : html`<label class="fld"><span>Their name</span><input name="inviteName" value="Jane" autocomplete="off"></label>
+      <button type="button" class="btn primary wide" data-act="invite-create">${icon('people')} Create invite link</button>`}
+  </div>`;
+}
+
+const inviteText = (inv, t) => `${S.me || getServer()?.name || 'I'} has invited you to share “${t.name}” (${fmtRange(t.start, t.end)}) in Travel Pack.
+
+Open this link on your phone, tap Join, then add Travel Pack to your home screen. The plan stays in sync between our phones and works offline.
+
+${inv.link}`;
+
+const inviteMailto = (inv, t) => `mailto:?subject=${encodeURIComponent(`Travel Pack: ${t.name}`)}&body=${encodeURIComponent(inviteText(inv, t))}`;
+
 VIEWS.share = (t) => {
   if (!t) return welcome();
   return html`${subBar('Share trip', 'more')}<form class="page form" data-form="share" onsubmit="return false">
-    <p class="lead">Send a read-only copy of the plan. It opens in Travel Pack and can be saved there for offline use. Tickets are never included in a link.</p>
+    ${inviteCard(t)}
+    <h2 class="sec-h">Send a copy</h2>
+    <p class="lead">A read-only snapshot of the plan as it is now. It opens in Travel Pack and can be saved for offline use, but later changes do not reach it. Tickets are never included in a link.</p>
     <fieldset><legend>Include</legend><div class="checks col">
       <label class="check"><input type="checkbox" name="refs" checked><span>Booking references</span></label>
       <label class="check"><input type="checkbox" name="contacts" checked><span>People & phone numbers</span></label>
@@ -1486,11 +1533,52 @@ VIEWS.connect = () => {
   </div>`;
 };
 
+const isStandalone = () => matchMedia('(display-mode: standalone)').matches || navigator.standalone === true;
+const isIos = () => /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+VIEWS.join = (t) => {
+  const j = S.incomingJoin;
+  if (!j) return VIEWS.today(t);  // just joined; the route moves to Today next
+  const srv = getServer();
+  const otherServer = srv && srv.url !== j.url;
+  // On iPhone the home-screen app has its own storage, separate from Safari,
+  // so joining in Safari would leave the installed app empty.
+  const iosFirst = isIos() && !isStandalone();
+  return html`${subBar('Join a trip', 'today')}<form class="page form" data-form="join" onsubmit="return false">
+    <div class="empty welcome">
+      <div class="logo-big">${icon('suitcase')}</div>
+      <h2>${j.from ? `${j.from} invited you` : 'You are invited'}</h2>
+      <p>to share <b>${j.trip || 'a trip'}</b> in Travel Pack. You will see the plan, tickets and contacts, and any change either of you makes appears on both phones. It works offline.</p>
+    </div>
+    ${iosFirst ? html`<div class="card tip static">${icon('info')}<div><b>On iPhone, install first</b>
+      <span>1. Tap <b>Copy invite link</b> below. 2. Tap the Share button ${icon('share', 'sm')} then <b>Add to Home Screen</b>. 3. Open Travel Pack from your home screen, tap <b>I have an invite link</b> and paste.</span></div></div>
+      <button type="button" class="btn primary wide" data-act="join-copy">${icon('copy')} Copy invite link</button>` : ''}
+    ${otherServer ? html`<div class="banner warn">${icon('alert', 'sm')}<div><b>This phone uses a different server</b><span>Joining will switch it to ${j.url}. Trips already on this phone stay here.</span></div></div>` : ''}
+    <label class="fld"><span>Your name</span><input name="name" value="${S.me || j.name || ''}" autocomplete="given-name" required></label>
+    <button type="button" class="btn ${iosFirst ? '' : 'primary'} wide" data-act="join-confirm" ${S.joinBusy ? 'disabled' : ''}>${S.joinBusy ? html`<span class="spinner"></span> Joining…` : html`${icon('check')} ${iosFirst ? 'Join here in Safari instead' : 'Join'}`}</button>
+    ${!S.online ? html`<p class="hint">Needs signal to join. After that it works offline.</p>` : ''}
+    <a class="btn ghost wide" href="#/today" data-act="join-cancel">Not now</a>
+  </form>`;
+};
+
+function installCard() {
+  if (!S.installHint || isStandalone()) return '';
+  return html`<div class="card install-card">
+    <div class="invite-head"><span class="tile">${icon('download')}</span><div><b>Put Travel Pack on your home screen</b>
+      <small>So it opens like an app and works with no signal.</small></div></div>
+    ${S.installPrompt ? html`<button class="btn primary wide" data-act="install">${icon('download')} Install</button>`
+      : isIos() ? html`<p class="hint">Tap the Share button ${icon('share', 'sm')} at the bottom of Safari, then <b>Add to Home Screen</b>.</p>`
+      : html`<p class="hint">Tap the browser menu <b>⋮</b> (top right), then <b>Install app</b> or <b>Add to Home screen</b>. If you opened this from Gmail or WhatsApp, first choose <b>Open in Chrome</b> from that menu.</p>`}
+    <button class="btn ghost xs" data-act="install-dismiss">Done</button>
+  </div>`;
+}
+
 VIEWS.sync = (t) => {
   const srv = getServer();
   if (!srv) {
     return html`${subBar('Live sharing & server', 'more')}<div class="page">
-      <div class="card tip static">${icon('info')}<div><b>Not connected</b><span>Open the connect link you were sent on this phone. It links Travel Pack to your private server for live sharing, email search and the AI assistant.</span></div></div></div>`;
+      <div class="card tip static">${icon('info')}<div><b>Not connected</b><span>Open the invite or connect link you were sent on this phone. It links Travel Pack to a private server for live sharing, email search and the AI assistant.</span></div></div>
+      <button class="btn wide" data-act="join-paste">${icon('people')} I have an invite link</button></div>`;
   }
   const a = S.account;
   const on = t && S.synced[t.id];
@@ -1506,8 +1594,9 @@ VIEWS.sync = (t) => {
       ${on ? html`<div class="row"><span class="row-ic">${icon('refresh')}</span><span class="row-main"><b>Shared live</b>
           <small>${S.sync.state === 'error' ? `Last attempt failed: ${S.sync.error}` : S.synced[t.id].at ? `Synced ${fmtUntil(new Date(S.synced[t.id].at), new Date())}` : 'Waiting to sync'}</small></span>
           <button class="btn xs" data-act="sync-now">Sync now</button></div>
+        <a class="row" href="#/share"><span class="row-ic">${icon('people')}</span><span class="row-main"><b>Invite someone</b><small>Send Jane or family a link to join this trip</small></span>${icon('right', 'sm dim')}</a>
         <button class="row" data-act="sync-off"><span class="row-ic">${icon('x')}</span><span class="row-main"><b>Stop sharing on this phone</b><small>Keeps the server copy for others</small></span></button>`
-      : html`<button class="row" data-act="sync-on"><span class="row-ic">${icon('refresh')}</span><span class="row-main"><b>Share this trip live</b><small>Anyone connected to your server (e.g. Jane) can see and edit it, tickets and journal included. Changes appear on every phone.</small></span>${icon('right', 'sm dim')}</button>`}
+      : html`<button class="row" data-act="sync-on"><span class="row-ic">${icon('refresh')}</span><span class="row-main"><b>Share this trip live</b><small>Puts it on your server so the people you invite can see and edit it. Changes appear on every phone.</small></span>${icon('right', 'sm dim')}</button>`}
     </div>` : ''}
     <h2 class="sec-h">Trips on the server</h2>
     <div class="card list-card">${S.serverTrips == null ? html`<div class="row"><span class="row-main"><small>${S.online ? 'Loading…' : 'Needs signal'}</small></span></div>`
@@ -2577,7 +2666,7 @@ Object.assign(ACT, {
     openSheet({
       title: 'Stop sharing this trip?', submit: '',
       body: html`<p>This phone keeps its copy and stops sending and receiving changes.</p>`,
-      extra: html`<button type="button" class="btn danger-ghost" data-act="sync-remove">Also remove from server</button><button type="button" class="btn primary" data-act="sync-stop">Stop on this phone</button>`,
+      extra: html`${S.account?.owner !== false ? html`<button type="button" class="btn danger-ghost" data-act="sync-remove">Also remove from server</button>` : ''}<button type="button" class="btn primary" data-act="sync-stop">Stop on this phone</button>`,
     });
   },
   async 'sync-stop'() {
@@ -2596,17 +2685,94 @@ Object.assign(ACT, {
   },
   async 'pull-trip'(el) {
     try {
-      const { trip: t, rev } = await api(`/api/trips/${encodeURIComponent(el.dataset.id)}`);
-      await storeTrip(t);
-      S.synced[t.id] = { rev, at: new Date().toISOString() };
-      await db.put('meta', S.synced, 'synced');
-      await setCurrentTrip(t.id);
-      toast('Downloading tickets…');
-      await syncFiles(t.id, t);
-      await loadFiles();
+      const t = await pullTrip(el.dataset.id);
       toast(`${t.name} is on this phone`);
-      go('today');
     } catch (e) { toast(e.message); }
+  },
+
+  /* ----- invites: share a trip live with someone else's phone ----- */
+  async 'invite-create'(el) {
+    const t = trip();
+    const name = String(el.closest('form').querySelector('[name=inviteName]').value || '').trim() || 'Guest';
+    el.disabled = true;
+    try {
+      // The trip has to be on the server before anyone can join it.
+      if (!S.synced[t.id]) {
+        S.synced[t.id] = { rev: 0, at: '' };
+        await db.put('meta', S.synced, 'synced');
+      }
+      await syncTrip(t.id);
+      if (S.sync.state === 'error') throw new Error(`Could not share the trip: ${S.sync.error}`);
+      const { code, expiresAt } = await api(`/api/trips/${encodeURIComponent(t.id)}/invites`, { method: 'POST', body: { name } });
+      const from = S.me || getServer().name;
+      S.invite = { tripId: t.id, name, expiresAt, link: joinLink(appUrl(), { url: getServer().url, code, trip: t.name, from, name }) };
+    } catch (e) { toast(e.message); }
+    render();
+  },
+  async 'invite-send'(el, e) {
+    e?.preventDefault();
+    const t = trip(), inv = S.invite;
+    const text = inviteText(inv, t);
+    if (navigator.share) {
+      try { await navigator.share({ title: `Travel Pack: ${t.name}`, text }); return; } catch (err) { if (err.name === 'AbortError') return; }
+    }
+    copyText(inv.link, 'invite link');
+  },
+  'invite-copy': () => copyText(S.invite.link, 'invite link'),
+  'invite-new': () => { S.invite = null; render(); },
+
+  async 'join-confirm'(el) {
+    const j = S.incomingJoin;
+    const name = String(el.closest('form').querySelector('[name=name]').value || '').trim();
+    if (!name) { toast('Add your name first'); return; }
+    S.joinBusy = true;
+    render();
+    try {
+      const srv = getServer();
+      const same = srv && srv.url === j.url;
+      const r = await redeemInvite(j.url, j.code, name, same ? srv.token : null);
+      if (r.token) {
+        // Switching servers: trips shared through the old one must not be pushed to the new one.
+        if (srv && !same) { S.synced = {}; await db.put('meta', S.synced, 'synced'); S.account = null; }
+        await setServer({ url: j.url, token: r.token, name: r.name });
+      }
+      if (!S.me) { S.me = name; await db.put('meta', S.me, 'me'); }
+      S.incomingJoin = null;
+      S.installHint = !isStandalone();
+      if (S.installHint) await db.put('meta', true, 'installHint');
+      const t = await pullTrip(r.tripId);
+      refreshAccount();
+      toast(`${t.name} is on this phone and will stay in sync`);
+    } catch (e) {
+      toast(e.message || 'Could not join. Check your signal and try again.');
+    } finally {
+      S.joinBusy = false;
+      if (S.route.name === 'join') render();
+    }
+  },
+  'join-cancel': () => { S.incomingJoin = null; },
+  'join-copy': () => copyText(joinLink(appUrl(), S.incomingJoin), 'invite link'),
+  'join-paste': () => {
+    openSheet({
+      title: 'Join with an invite link',
+      submit: 'Continue',
+      body: html`<label class="fld"><span>Invite link</span><textarea name="link" rows="4" placeholder="Paste the link you were sent" required></textarea></label>`,
+      onSubmit: (fd) => {
+        const v = String(fd.get('link') || '');
+        const i = v.indexOf('#join=');
+        try {
+          if (i < 0) throw new Error();
+          S.incomingJoin = readJoinLink(v.slice(i + 1).trim());
+        } catch { toast('That is not a Travel Pack invite link.'); return; }
+        closeSheet();
+        go('join');
+      },
+    });
+  },
+  async 'install-dismiss'() {
+    S.installHint = false;
+    await db.del('meta', 'installHint');
+    render();
   },
 
   async 'gmail-connect'() {
@@ -2730,6 +2896,26 @@ Object.assign(FORMS, {
     form.reset();
   },
 });
+
+const appUrl = () => location.origin + location.pathname;
+
+/** Download a trip from the server (merging with any copy already here) and keep it in sync. */
+async function pullTrip(id) {
+  const { trip: remote, rev } = await api(`/api/trips/${encodeURIComponent(id)}`);
+  const here = S.trips.find((x) => x.id === id);
+  const t = here ? mergeTrips(here, remote) : remote;
+  await storeTrip(t);
+  S.synced[t.id] = { rev, at: new Date().toISOString() };
+  await db.put('meta', S.synced, 'synced');
+  await setCurrentTrip(t.id);
+  // Show the plan straight away; tickets follow in the background of this call.
+  if (S.route.name === 'today') render(); else go('today');
+  toast('Downloading tickets…');
+  await syncFiles(t.id, t);
+  await loadFiles();
+  if (here) scheduleSync(t.id);
+  return t;
+}
 
 async function loadServerTrips() {
   if (!getServer() || !navigator.onLine) return;

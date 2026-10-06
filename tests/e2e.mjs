@@ -76,7 +76,7 @@ async function importFixture(page) {
 
 async function section(name, fn) {
   console.log(name);
-  try { await fn(); } catch (e) { failed++; console.log('  ✗ ' + e.message.split('\n')[0]); }
+  try { await fn(); } catch (e) { failed++; console.log('  ✗ ' + e.message.split('\n')[0] + (process.env.DEBUG ? '\n' + e.stack : '')); }
 }
 
 const { ctx, page: p } = await phone();
@@ -399,6 +399,7 @@ await section('Server: live sharing between two phones, AI, Gmail', async () => 
   await j.waitForSelector('[data-act=pull-trip]', { timeout: 10000 });
   await j.click('[data-act=pull-trip]');
   await j.waitForSelector('.hero-wrap', { timeout: 15000 });
+  await j.waitForFunction(() => window.__tp.S.files.length >= 2, null, { timeout: 15000 }).catch(() => {});
   const janeFiles = await j.evaluate(() => window.__tp.S.files.length);
   ok(janeFiles >= 2, `Jane gets the trip with its tickets and photos (${janeFiles} files)`);
   ok(await j.evaluate(() => window.__tp.S.trips[0].items.some((i) => i.ref === 'TESTREF1')), "Clive's edits are in Jane's copy");
@@ -429,6 +430,57 @@ await section('Server: live sharing between two phones, AI, Gmail', async () => 
   const seats = (pg) => pg.evaluate(() => window.__tp.S.trips[0].items.filter((i) => ['it_lner', 'it_tpe'].includes(i.id)).map((i) => i.seat).join('/'));
   ok((await seats(p)) === 'Coach L 1/Coach E 2' && (await seats(j)) === 'Coach L 1/Coach E 2', 'simultaneous edits on two phones both survive');
   await cj.close();
+
+  // Clive invites someone new from the Share page; they join from the link alone.
+  await p.goto(at('2030-05-08T12:00', 'share'));
+  await shot(p, '40-share-invite');
+  await p.fill('input[name=inviteName]', 'Sam');
+  await p.click('[data-act=invite-create]');
+  await p.waitForSelector('[data-act=invite-send]', { timeout: 10000 });
+  ok((await p.textContent('.invite-ready')).includes('Sam'), 'Share page creates an invite link for a named person');
+  ok((await p.getAttribute('.invite-ready a[href^="mailto:"]', 'href')).includes('join%3D'), 'the invite can be emailed');
+  await shot(p, '41-share-invite-ready');
+  const invite = await p.evaluate(() => window.__tp.S.invite.link);
+  ok(!invite.includes('tok-clive'), "the invite link does not carry Clive's access token");
+  const joinHash = invite.slice(invite.indexOf('#join='));
+
+  const { ctx: cs, page: sam } = await phone();
+  await sam.goto(`${BASE}?now=2030-05-08T12:00${joinHash}`);
+  await sam.waitForSelector('[data-act=join-confirm]');
+  ok((await sam.textContent('.page')).includes('invited you'), 'a fresh phone opening the invite sees who invited them');
+  await shot(sam, '42-join');
+  await sam.fill('input[name=name]', 'Sam');
+  await sam.click('[data-act=join-confirm]');
+  await sam.waitForSelector('.hero-wrap', { timeout: 15000 });
+  ok(await sam.evaluate(() => window.__tp.S.trips.length === 1 && window.__tp.S.trips[0].items.some((i) => i.ref === 'TESTREF1')), 'the trip downloads onto the new phone');
+  ok(!!(await sam.$('.install-card')), 'after joining, the app shows how to put it on the home screen');
+  await sam.waitForFunction(() => window.__tp.S.files.length >= 2, null, { timeout: 15000 }).catch(() => {});
+  ok(await sam.evaluate(() => window.__tp.S.files.length >= 2), 'tickets follow onto the new phone');
+  await shot(sam, '43-joined-today');
+  ok(await sam.evaluate(() => window.__tp.S.docs.length === 0), 'documents are not shared');
+
+  await sam.goto(at('2030-05-08T12:00', 'edit/it_lm0706'));
+  await sam.fill('input[name=seat]', '4D');
+  await sam.click('button[type=submit]');
+  await sam.waitForSelector('.d-head');
+  await sam.waitForTimeout(2500);
+  await p.goto(at('2030-05-08T12:00', 'sync'));
+  await p.click('[data-act=sync-now]');
+  await p.waitForTimeout(800);
+  ok(await p.evaluate(() => window.__tp.S.trips[0].items.find((i) => i.id === 'it_lm0706')?.seat === '4D'), "the invited person's change reaches Clive");
+
+  // The link is single-use.
+  const { ctx: cx, page: x } = await phone();
+  await x.goto(`${BASE}?now=2030-05-08T12:00${joinHash}`);
+  await x.fill('input[name=name]', 'Someone');
+  await x.click('[data-act=join-confirm]');
+  await x.waitForFunction(() => document.getElementById('toast').textContent.includes('already been used'), null, { timeout: 10000 });
+  ok(await x.evaluate(() => window.__tp.S.trips.length === 0), 'an invite link works only once');
+  await cx.close();
+  await sam.goto(at('2030-05-08T12:00', 'sync'));
+  await sam.click('[data-act=sync-off]');
+  ok(!(await sam.$('[data-act=sync-remove]')), 'an invited person cannot remove the trip from the server');
+  await cs.close();
 
   // AI: paste an email, review, add.
   await p.goto(at('2030-05-08T12:00', 'plan'));

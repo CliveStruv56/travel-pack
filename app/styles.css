@@ -562,3 +562,15 @@ input[type=date], input[type=time] { min-width: 0; -webkit-appearance: none; app
 .doc-pick { margin: 12px 0 4px; }
 .doc-pick .btn { flex: 1; padding: 0 8px; gap: 6px; }
 .pdf-tile { width: 56px; height: 56px; border-radius: 8px; display: grid; place-items: center; font-size: 12px; background: var(--surface-2); border: 1px solid var(--line); color: var(--muted); }
+
+/* Invites (share live) and the install prompt after joining */
+.invite-card, .install-card { padding: 14px; margin-bottom: 14px; display: flex; flex-direction: column; gap: 10px; }
+.invite-head { display: flex; gap: 12px; align-items: flex-start; }
+.invite-head > div { display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.invite-head small { color: var(--muted); font-size: 13.5px; line-height: 1.4; }
+.invite-head .tile { background: var(--brand-soft, var(--b-other)); color: var(--brand); }
+.invite-ready { display: flex; flex-direction: column; gap: 8px; }
+.invite-ready p { margin: 0; font-size: 14px; }
+.invite-ready .btn.xs { align-self: center; }
+.install-card .hint { margin: 0; }
+.install-card .btn.xs { align-self: flex-end; }

@@ -154,6 +154,65 @@ test('files: upload, list, download, tombstone', async () => {
   assert.equal((await call('/api/files/..%2Fx?trip=trip_s', { method: 'PUT', body: Buffer.from('x') })).status, 400);
 });
 
+test('invites: one-time link gives a new phone access to that trip only', async () => {
+  // A second trip the invited person must never see.
+  const other = { ...baseTrip(), id: 'trip_other', name: 'Private' };
+  await call('/api/trips/trip_other/sync', { method: 'POST', body: { trip: other } });
+  assert.equal((await call('/api/trips/nope/invites', { method: 'POST', body: { name: 'Sam' } })).status, 409);
+  const { code, expiresAt } = await (await call('/api/trips/trip_s/invites', { method: 'POST', body: { name: 'Sam' } })).json();
+  assert.ok(code && expiresAt > new Date().toISOString());
+
+  assert.equal((await call('/api/invites/redeem', { auth: null, method: 'POST', body: { code: 'wrong' } })).status, 404);
+  const red = await (await call('/api/invites/redeem', { auth: null, method: 'POST', body: { code, name: 'Sam' } })).json();
+  assert.equal(red.tripId, 'trip_s');
+  assert.equal(red.tripName, 'Sample');
+  assert.ok(red.token);
+  // Single use.
+  assert.equal((await call('/api/invites/redeem', { auth: null, method: 'POST', body: { code } })).status, 410);
+
+  const SAM = `Bearer ${red.token}`;
+  const me = await (await call('/api/me', { auth: SAM })).json();
+  assert.equal(me.name, 'Sam');
+  assert.equal(me.owner, false);
+  const list = await (await call('/api/trips', { auth: SAM })).json();
+  assert.deepEqual(list.map((t) => t.id), ['trip_s']);
+  assert.equal((await call('/api/trips/trip_other', { auth: SAM })).status, 404);
+  assert.equal((await call('/api/trips/trip_other/sync', { auth: SAM, method: 'POST', body: { trip: other } })).status, 404);
+  assert.equal((await call('/api/trips/trip_other/files', { auth: SAM })).status, 404);
+  assert.equal((await call('/api/files/f_x?trip=trip_other', { auth: SAM, method: 'PUT', body: Buffer.from('x') })).status, 404);
+  assert.equal((await call('/api/trips/trip_other/invites', { auth: SAM, method: 'POST', body: {} })).status, 404);
+  assert.equal((await call('/api/trips/trip_s', { auth: SAM, method: 'DELETE' })).status, 403);
+
+  // Sam edits; Clive sees it.
+  const t = (await (await call('/api/trips/trip_s', { auth: SAM })).json()).trip;
+  const before = structuredClone(t);
+  t.items.push({ id: 'i_sam', type: 'other', date: '2030-05-12', title: 'Picnic' });
+  stampChanges(before, t, '2030-01-05T00:00:00.000Z');
+  assert.equal((await call('/api/trips/trip_s/sync', { auth: SAM, method: 'POST', body: { trip: t } })).status, 200);
+  const clive = (await (await call('/api/trips/trip_s')).json()).trip;
+  assert.ok(clive.items.some((i) => i.title === 'Picnic'));
+
+  // A trip Sam creates is Sam's to see.
+  const mine = { ...baseTrip(), id: 'trip_sam', name: 'Sam trip' };
+  assert.equal((await call('/api/trips/trip_sam/sync', { auth: SAM, method: 'POST', body: { trip: mine } })).status, 200);
+  assert.deepEqual((await (await call('/api/trips', { auth: SAM })).json()).map((x) => x.id).sort(), ['trip_s', 'trip_sam']);
+
+  // A second invite redeemed by an already-connected phone adds the trip to it, no new token.
+  const inv2 = await (await call('/api/trips/trip_other/invites', { method: 'POST', body: { name: 'Sam' } })).json();
+  const red2 = await (await call('/api/invites/redeem', { auth: SAM, method: 'POST', body: { code: inv2.code } })).json();
+  assert.equal(red2.token, null);
+  assert.equal((await call('/api/trips/trip_other', { auth: SAM })).status, 200);
+  await call('/api/trips/trip_other', { method: 'DELETE' });
+  await call('/api/trips/trip_sam', { method: 'DELETE' });
+});
+
+test('invites: expired links are refused', async () => {
+  const { code } = await (await call('/api/trips/trip_s/invites', { method: 'POST', body: {} })).json();
+  const { tokenHash } = await import('./auth.mjs');
+  app.db.addInvite(tokenHash(code + 'x'), 'trip_s', 'Old', 'clive', '2020-01-01T00:00:00.000Z');
+  assert.equal((await call('/api/invites/redeem', { auth: null, method: 'POST', body: { code: code + 'x' } })).status, 410);
+});
+
 test('AI extract: sends a structured-output request and returns items', async () => {
   const r = await call('/api/ai/extract', { method: 'POST', body: { text: 'Booking reference: SMP123', source: 'email', trip: baseTrip(), attachments: [{ type: 'application/pdf', data: 'JVBERg==' }, { type: 'text/html', data: 'x' }] } });
   assert.equal(r.status, 200);

@@ -13,6 +13,8 @@ export function openDb(path = process.env.DB_PATH || './data/travel-pack.db') {
     CREATE TABLE IF NOT EXISTS files (id TEXT PRIMARY KEY, trip_id TEXT NOT NULL, meta TEXT NOT NULL, type TEXT, size INTEGER, blob BLOB NOT NULL, updated_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS files_trip ON files(trip_id);
     CREATE TABLE IF NOT EXISTS gmail (user TEXT PRIMARY KEY, refresh_token TEXT NOT NULL, email TEXT, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS members (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, trips TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS invites (code_hash TEXT PRIMARY KEY, trip_id TEXT NOT NULL, name TEXT NOT NULL, created_by TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT, used_by TEXT);
   `);
   const q = {
     tripList: db.prepare('SELECT id, data, rev, updated_at FROM trips ORDER BY updated_at DESC'),
@@ -28,7 +30,15 @@ export function openDb(path = process.env.DB_PATH || './data/travel-pack.db') {
     gmailGet: db.prepare('SELECT refresh_token, email FROM gmail WHERE user = ?'),
     gmailPut: db.prepare('INSERT INTO gmail (user, refresh_token, email, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(user) DO UPDATE SET refresh_token = excluded.refresh_token, email = excluded.email, updated_at = excluded.updated_at'),
     gmailDel: db.prepare('DELETE FROM gmail WHERE user = ?'),
+    memberByHash: db.prepare('SELECT id, name, trips FROM members WHERE token_hash = ?'),
+    memberById: db.prepare('SELECT id, name, trips FROM members WHERE id = ?'),
+    memberAdd: db.prepare('INSERT INTO members (id, name, token_hash, trips, created_at) VALUES (?, ?, ?, ?, ?)'),
+    memberTrips: db.prepare('UPDATE members SET trips = ? WHERE id = ?'),
+    inviteAdd: db.prepare('INSERT INTO invites (code_hash, trip_id, name, created_by, expires_at) VALUES (?, ?, ?, ?, ?)'),
+    inviteGet: db.prepare('SELECT trip_id, name, created_by, expires_at, used_at FROM invites WHERE code_hash = ?'),
+    inviteUse: db.prepare('UPDATE invites SET used_at = ?, used_by = ? WHERE code_hash = ? AND used_at IS NULL'),
   };
+  const member = (r) => (r ? { id: r.id, name: r.name, trips: JSON.parse(r.trips) } : null);
   const now = () => new Date().toISOString();
   return {
     listTrips: () => q.tripList.all().map((r) => ({ trip: JSON.parse(r.data), rev: r.rev, updatedAt: r.updated_at })),
@@ -49,6 +59,20 @@ export function openDb(path = process.env.DB_PATH || './data/travel-pack.db') {
     getGmail: (user) => q.gmailGet.get(user) || null,
     putGmail: (user, token, email) => q.gmailPut.run(user, token, email || '', now()),
     deleteGmail: (user) => q.gmailDel.run(user),
+    memberByHash: (h) => member(q.memberByHash.get(h)),
+    getMember: (id) => member(q.memberById.get(id)),
+    addMember: (id, name, hash, trips) => q.memberAdd.run(id, name, hash, JSON.stringify(trips), now()),
+    grantTrip(id, tripId) {
+      const m = member(q.memberById.get(id));
+      if (m && !m.trips.includes(tripId)) q.memberTrips.run(JSON.stringify([...m.trips, tripId]), id);
+    },
+    addInvite: (hash, tripId, name, by, expires) => q.inviteAdd.run(hash, tripId, name, by, expires),
+    getInvite(hash) {
+      const r = q.inviteGet.get(hash);
+      return r ? { tripId: r.trip_id, name: r.name, createdBy: r.created_by, expiresAt: r.expires_at, usedAt: r.used_at } : null;
+    },
+    /** True only for the first caller: an invite can be used once. */
+    useInvite: (hash, by) => q.inviteUse.run(now(), by, hash).changes === 1,
     close: () => db.close(),
   };
 }

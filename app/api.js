@@ -51,3 +51,39 @@ export function readConnectLink(fragment) {
   if (!data || !/^https?:\/\//.test(data.u || '') || !data.t || !data.n) throw new Error('Not a Travel Pack connect link');
   return { url: data.u.replace(/\/$/, ''), token: data.t, name: data.n };
 }
+
+const b64url = (o) => btoa(unescape(encodeURIComponent(JSON.stringify(o)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+/**
+ * "#join=…" links invite someone to share one trip live. They carry the server
+ * address and a one-time code (never a long-lived token), plus names to show.
+ */
+export function joinLink(appUrl, { url, code, trip, from, name }) {
+  return `${appUrl}#join=${b64url({ u: url, c: code, t: trip, f: from, n: name })}`;
+}
+
+export function readJoinLink(fragment) {
+  const b64 = fragment.replace(/^#?join=/, '').replace(/-/g, '+').replace(/_/g, '/');
+  const data = JSON.parse(decodeURIComponent(escape(atob(b64))));
+  if (!data || !/^https?:\/\//.test(data.u || '') || !data.c) throw new Error('Not a Travel Pack invite link');
+  return { url: data.u.replace(/\/$/, ''), code: data.c, trip: data.t || '', from: data.f || '', name: data.n || '' };
+}
+
+/** Trade an invite code for access. Works before this phone has any server. */
+export async function redeemInvite(url, code, name, token) {
+  if (!navigator.onLine) throw new ApiError(0, 'No signal. Try again when you are online.');
+  let res;
+  try {
+    res = await fetch(`${url.replace(/\/$/, '')}/api/invites/redeem`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      body: JSON.stringify({ code, name }),
+      signal: AbortSignal.timeout(30000),
+    });
+  } catch {
+    throw new ApiError(0, 'Could not reach the server.');
+  }
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new ApiError(res.status, data.error || `Server error ${res.status}`);
+  return data;
+}

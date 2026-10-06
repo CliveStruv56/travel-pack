@@ -11,14 +11,26 @@ export function parseUsers(spec = process.env.USERS || '') {
   }).filter((u) => u.name && u.hash);
 }
 
-export function authenticate(header, users) {
+export const tokenHash = (token) => sha(token).toString('hex');
+
+/**
+ * Who is calling. People in USERS see every trip on the server. People who
+ * joined through an invite (db members) see only the trips they were invited
+ * to, plus any they create themselves.
+ */
+export function authenticate(header, users, db) {
   const m = /^Bearer\s+(\S+)$/i.exec(header || '');
   if (!m) return null;
   const h = sha(m[1]);
   let found = null;
   for (const u of users) if (timingSafeEqual(h, u.hash)) found = u.name;
-  return found;
+  if (found) return { id: found, name: found, all: true, trips: [] };
+  const member = db?.memberByHash(h.toString('hex'));
+  return member ? { ...member, all: false } : null;
 }
+
+export const newToken = () => randomBytes(24).toString('hex');
+export const newCode = () => randomBytes(16).toString('base64url');
 
 /** Signed, expiring state for the Google sign-in round trip. */
 export function signState(user, secret, ttlMs = 10 * 60000) {

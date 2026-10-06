@@ -17,7 +17,7 @@ Personal **documents** (passport, insurance…) never leave the phone and are ne
 
 | Variable | What |
 | --- | --- |
-| `USERS` | `clive:<token>,jane:<token>`, one long random token per person (`openssl rand -hex 24`) |
+| `USERS` | `clive:<token>`: the trip owners, one long random token each (`openssl rand -hex 24`). Owners see every trip on the server. Everyone else joins by invite (below). |
 | `SESSION_SECRET` | random string, signs the Google sign-in round trip |
 | `PUBLIC_URL` | this server's https address, e.g. `https://travel-pack.up.railway.app` |
 | `APP_URL` | `https://clivestruv56.github.io/travel-pack/` |
@@ -38,6 +38,22 @@ npm run connect-link -- https://clivestruv56.github.io/travel-pack/ https://<ser
 
 Open the link on the phone and tap **Connect**. Treat the link like a password.
 To revoke a phone, change that person's token in `USERS` and redeploy.
+
+## Inviting someone to a trip (no server work needed)
+
+In the app: **More → Share this trip → Create invite link**, then send it by WhatsApp,
+text or email. The other person opens it on their phone, taps **Join**, and the trip
+downloads; the app then shows how to add it to the home screen. From then on the trip
+syncs both ways.
+
+- The link carries a one-time code, never a token. It works once and expires after 7
+  days; only its hash is stored. Redeeming gives that phone its own token.
+- Invited people (the `members` table) see only the trips they were invited to, plus
+  any they create. They cannot remove a trip from the server. Owners in `USERS` see all.
+- Personal documents are never synced, so they are never shared.
+- On iPhone the home-screen app has storage separate from Safari, so the join page asks
+  them to install first and paste the link into the installed app.
+- To revoke an invited phone: delete its row from `members`.
 
 ## Gmail: one-off Google setup (about 10 minutes)
 
