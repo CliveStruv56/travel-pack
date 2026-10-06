@@ -291,12 +291,31 @@ await section('Documents', async () => {
   await p.fill('.sheet-panel input[name=title]', 'UK passport');
   await p.fill('.sheet-panel input[name=number]', '123456789');
   await p.fill('.sheet-panel input[name=expiry]', '2030-12-01');
+  ok(await p.$('.sheet-panel input[name=files][accept="image/*,application/pdf"]') && await p.$('.sheet-panel input[name=camera][capture=environment]') && await p.$('.sheet-panel input[name=scan][capture=environment]'), 'add form offers Upload, Photo and Scan');
+  await p.setInputFiles('.sheet-panel input[name=files]', OUT + 'fake-pass.png');
+  ok((await p.textContent('.sheet-panel .jn-previews')).includes('1 photo'), 'chosen file previews in the form');
   await p.click('.sheet-panel .btn.primary');
   await p.waitForSelector('.d-head');
   ok((await p.textContent('.d-head')).includes('Expires'), 'expiry within six months is flagged');
-  await p.click('[data-act=add-doc-files]');
-  await p.setInputFiles('#file-input', OUT + 'fake-pass.png');
   await p.waitForSelector('.thumb:not(.add)');
+  ok(true, 'file attached while creating the document');
+  // A PDF from the document page, and a scan that comes out as a clean greyscale page.
+  await p.setInputFiles('.doc-pick input[name=files]', { name: 'policy.pdf', mimeType: 'application/pdf', buffer: Buffer.from('%PDF-1.4 test') });
+  await p.waitForFunction(() => document.querySelectorAll('.thumb').length === 2);
+  ok((await p.textContent('.thumbs')).includes('PDF'), 'PDF upload accepted');
+  const photo = await p.evaluate(() => { const c = document.createElement('canvas'); c.width = 400; c.height = 300; const g = c.getContext('2d'); g.fillStyle = '#c8b48c'; g.fillRect(0, 0, 400, 300); g.fillStyle = '#3a2a10'; g.fillRect(50, 100, 300, 30); return c.toDataURL('image/jpeg').split(',')[1]; });
+  await p.setInputFiles('.doc-pick input[name=scan]', { name: 'page.jpg', mimeType: 'image/jpeg', buffer: Buffer.from(photo, 'base64') });
+  await p.waitForFunction(() => document.querySelectorAll('.thumb').length === 3);
+  const scan = await p.evaluate(async () => {
+    const f = window.__tp.S.docFiles.find((x) => x.name.endsWith('-scan.jpg'));
+    const bmp = await createImageBitmap(f.blob); const c = document.createElement('canvas'); c.width = bmp.width; c.height = bmp.height;
+    const g = c.getContext('2d'); g.drawImage(bmp, 0, 0); const paper = g.getImageData(10, 10, 1, 1).data, ink = g.getImageData(200, 115, 1, 1).data;
+    return { type: f.type, paper: [...paper.slice(0, 3)], ink: ink[0] };
+  });
+  ok(scan.type === 'image/jpeg' && Math.abs(scan.paper[0] - scan.paper[2]) < 6 && scan.paper[0] > 235 && scan.ink < 60, `scan is greyscale with white paper and dark print (${JSON.stringify(scan)})`);
+  await p.click('[data-act=doc-sheet]');
+  ok((await p.$$eval('.sheet-panel select[name=category] option', (o) => o.map((x) => x.textContent))).includes('Car insurance'), 'Car insurance category available');
+  await p.click('.sheet-panel [data-act=close-sheet]');
   await p.click('.thumb:not(.add)');
   await p.waitForSelector('.viewer');
   ok((await p.textContent('.v-title')).includes('UK passport'), 'document photo opens in the viewer');
@@ -328,6 +347,7 @@ await section('Journal', async () => {
   await p.waitForSelector('.viewer');
   ok((await p.textContent('.v-title')).includes('Journal'), 'photo opens full screen');
   await p.goto(at('2030-05-09T21:00', 'today'));
+  await p.waitForSelector('a.tip[href^="#/journal/"]');
   ok((await p.$$('.jn-strip img')).length >= 3, "Today's journal card shows the day's photos");
   await shot(p, '09-journal');
 });

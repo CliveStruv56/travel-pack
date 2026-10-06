@@ -1006,6 +1006,7 @@ const DOC_CATS = {
   passport: { label: 'Passport & ID', icon: 'lock' },
   licence: { label: 'Driving licence', icon: 'car' },
   insurance: { label: 'Travel insurance', icon: 'info' },
+  car: { label: 'Car insurance', icon: 'car' },
   health: { label: 'Health & medical', icon: 'alert' },
   railcard: { label: 'Railcards & passes', icon: 'train' },
   cards: { label: 'Cards & memberships', icon: 'wallet' },
@@ -1109,12 +1110,13 @@ VIEWS.doc = (t, [id]) => {
   <div class="page detail">
     <div class="d-head"><span class="tile lg">${icon(c.icon)}</span><div><h2>${d.title}</h2>${d.holder ? html`<p>${d.holder}</p>` : ''}</div>
       ${ex ? html`<span class="chip exp ${ex.cls}">${ex.text}</span>` : ''}</div>
-    <div class="thumbs">${files.map((f) => thumb(f))}<button class="thumb add" data-act="add-doc-files" data-id="${d.id}">${icon('plus')}<span>Add photo</span></button></div>
-    <div class="card kvs">
+    ${files.length ? html`<div class="thumbs">${files.map((f) => thumb(f))}</div>` : html`<div class="slim quiet">${icon('image', 'sm')}<span>No copy saved yet. Upload a PDF or photo, take a photo, or scan the page.</span></div>`}
+    ${docPickers('doc-files', d.id)}
+    ${d.number || d.expiry || d.phone ? html`<div class="card kvs">
       ${d.number ? html`<div class="kv"><span>Number</span><b class="mono">${d.number}</b><button class="icon-btn sm" data-act="copy" data-v="${d.number}" aria-label="Copy number">${icon('copy')}</button></div>` : ''}
       ${d.expiry ? html`<div class="kv"><span>Expires</span><b>${fmtLongDay(d.expiry)}</b></div>` : ''}
       ${d.phone ? html`<div class="kv"><span>Helpline</span><b>${d.phone}</b><a class="icon-btn sm" href="${telHref(d.phone)}" aria-label="Call">${icon('phone')}</a></div>` : ''}
-    </div>
+    </div>` : ''}
     ${d.notes ? html`<h3 class="sec-h">Notes</h3><div class="card notes">${d.notes}</div>` : ''}
     <div class="d-actions"><button class="btn" data-act="doc-sheet" data-id="${d.id}">${icon('edit')} Edit</button>
       <button class="btn danger-ghost" data-act="del-doc" data-id="${d.id}">${icon('trash')} Delete</button></div>
@@ -1130,17 +1132,83 @@ function docSheet(d) {
       <label class="fld"><span>Expires</span><input type="date" name="expiry" value="${d?.expiry || ''}"></label></div>
       <div class="two"><label class="fld"><span>Holder</span><input name="holder" value="${d?.holder || ''}"></label>
       <label class="fld"><span>Helpline</span><input type="tel" name="phone" value="${d?.phone || ''}"></label></div>
-      <label class="fld"><span>Notes</span><textarea name="notes" rows="3">${d?.notes || ''}</textarea></label>`,
+      <label class="fld"><span>Notes</span><textarea name="notes" rows="3">${d?.notes || ''}</textarea></label>
+      <div class="fld"><span>Copy of the document <small>PDF, photo or scan</small></span>
+        <div class="jn-previews"></div>${docPickers('journal-photos')}</div>`,
     onSubmit: async (fd) => {
+      const files = await pickedFiles(sheetRoot);
       const rec = { id: d?.id || uid('doc_'), createdAt: d?.createdAt || new Date().toISOString() };
       for (const k of ['category', 'title', 'number', 'expiry', 'holder', 'phone', 'notes']) rec[k] = String(fd.get(k) || '').trim();
       const i = S.docs.findIndex((x) => x.id === rec.id);
       if (i >= 0) S.docs[i] = rec; else S.docs.push(rec);
       await saveDocs();
       closeSheet();
+      if (files.length) { await loadDocFiles(); await addDocFiles(rec.id, files); }
       if (!d) go(`doc/${rec.id}`); else render();
     },
   });
+}
+
+/** Upload, Photo and Scan buttons. Scan uses the camera and then cleans the
+ *  picture up to look like a scanned page (see enhanceScan). */
+function docPickers(change, id = '') {
+  const data = raw(`data-change="${change}"${id ? ` data-id="${id}"` : ''}`);
+  return html`<div class="jn-actions doc-pick">
+    <label class="btn">${icon('upload')} Upload<input type="file" name="files" accept="image/*,application/pdf" multiple hidden ${data}></label>
+    <label class="btn">${icon('camera')} Photo<input type="file" name="camera" accept="image/*" capture="environment" hidden ${data}></label>
+    <label class="btn">${icon('scan')} Scan<input type="file" name="scan" accept="image/*" capture="environment" hidden ${data}></label>
+  </div>`;
+}
+
+/** Files chosen in a picker form, with Scan pictures turned into clean pages. */
+async function pickedFiles(root) {
+  const out = [];
+  for (const input of root.querySelectorAll('input[type=file]')) {
+    for (const f of input.files) {
+      if (!f.size) continue;
+      out.push(input.name === 'scan' ? await enhanceScan(f) : f);
+    }
+  }
+  return out;
+}
+
+/**
+ * Make a phone photo of a document read like a scan: greyscale, with the
+ * levels stretched so the paper goes white and the print goes dark. It keeps
+ * the whole picture (no cropping), so nothing on the page is ever cut off.
+ */
+async function enhanceScan(file) {
+  try {
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, 2400 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement('canvas');
+    c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+    const g = c.getContext('2d');
+    g.drawImage(bmp, 0, 0, c.width, c.height);
+    const img = g.getImageData(0, 0, c.width, c.height);
+    const px = img.data;
+    const hist = new Uint32Array(256);
+    for (let i = 0; i < px.length; i += 4) {
+      const y = Math.round(0.299 * px[i] + 0.587 * px[i + 1] + 0.114 * px[i + 2]);
+      px[i] = y; hist[y]++;
+    }
+    const total = px.length / 4;
+    let lo = 0, hi = 255, acc = 0;
+    for (; lo < 255 && (acc += hist[lo]) < total * 0.02; lo++);
+    acc = 0;
+    for (; hi > lo + 1 && (acc += hist[hi]) < total * 0.10; hi--);
+    const span = Math.max(hi - lo, 1);
+    for (let i = 0; i < px.length; i += 4) {
+      const v = Math.max(0, Math.min(255, ((px[i] - lo) / span) * 255));
+      const out = 255 * Math.pow(v / 255, 1.2);
+      px[i] = px[i + 1] = px[i + 2] = out;
+    }
+    g.putImageData(img, 0, 0);
+    const blob = await new Promise((r) => c.toBlob(r, 'image/jpeg', 0.85));
+    return new File([blob], (file.name || 'scan').replace(/\.\w+$/, '') + '-scan.jpg', { type: 'image/jpeg' });
+  } catch {
+    return file;
+  }
 }
 
 async function addDocFiles(docId, fileList) {
@@ -1152,7 +1220,8 @@ async function addDocFiles(docId, fileList) {
   }
   askPersist();
   render();
-  toast(`${fileList.length} photo${fileList.length === 1 ? '' : 's'} added`);
+  const pdfs = fileList.filter((f) => f.type === 'application/pdf').length;
+  toast(`${fileList.length} ${pdfs === fileList.length ? 'file' : 'item'}${fileList.length === 1 ? '' : 's'} added`);
 }
 
 /* =====================================================================
@@ -2326,13 +2395,19 @@ const FORMS = {
 };
 
 const CHANGE = {
+  async 'doc-files'(el) {
+    const files = await pickedFiles(el.closest('.doc-pick'));
+    el.value = '';
+    if (files.length) await addDocFiles(el.dataset.id, files);
+  },
   'journal-photos'(el) {
     const form = el.closest('form');
     const box = form.querySelector('.jn-previews');
     for (const u of box.querySelectorAll('img')) URL.revokeObjectURL(u.src);
     const files = [...form.querySelectorAll('input[type=file]')].flatMap((i) => [...i.files]);
-    box.innerHTML = files.map((f) => `<img src="${URL.createObjectURL(f)}" alt="">`).join('');
-    if (files.length) box.insertAdjacentHTML('beforeend', `<span>${files.length} photo${files.length === 1 ? '' : 's'}</span>`);
+    box.innerHTML = files.map((f) => (f.type.startsWith('image/') ? `<img src="${URL.createObjectURL(f)}" alt="">` : '<b class="pdf-tile">PDF</b>')).join('');
+    const allImages = files.every((f) => f.type.startsWith('image/'));
+    if (files.length) box.insertAdjacentHTML('beforeend', `<span>${files.length} ${allImages ? 'photo' : 'file'}${files.length === 1 ? '' : 's'}</span>`);
   },
   type(el) {
     const form = el.closest('form');

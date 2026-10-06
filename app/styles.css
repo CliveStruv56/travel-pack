@@ -557,3 +557,8 @@ input[type=date], input[type=time] { min-width: 0; -webkit-appearance: none; app
 .jn-previews span { font-size: 13px; color: var(--muted); }
 .jn-strip { display: flex; gap: 4px; margin: 6px 0 2px; }
 .jn-strip img { width: 44px; height: 44px; object-fit: cover; border-radius: 8px; }
+
+/* document pickers */
+.doc-pick { margin: 12px 0 4px; }
+.doc-pick .btn { flex: 1; padding: 0 8px; gap: 6px; }
+.pdf-tile { width: 56px; height: 56px; border-radius: 8px; display: grid; place-items: center; font-size: 12px; background: var(--surface-2); border: 1px solid var(--line); color: var(--muted); }
