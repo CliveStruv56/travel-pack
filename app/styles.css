@@ -588,3 +588,15 @@ input[type=date], input[type=time] { min-width: 0; -webkit-appearance: none; app
 .v-note { color: #cbd5e1; text-align: center; margin: 8px 0 0; }
 .jn-actions { flex-wrap: wrap; }
 .jn-actions .btn.primary { flex-basis: 100%; }
+
+/* Removing photos and videos from a journal entry */
+.rm-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+.rm-tile { position: relative; display: block; aspect-ratio: 1; border-radius: 10px; overflow: hidden; background: var(--surface-2); cursor: pointer; }
+.rm-tile img, .rm-tile .vid-tile, .rm-tile video { width: 100%; height: 100%; object-fit: cover; display: block; }
+.rm-tile input { position: absolute; opacity: 0; pointer-events: none; }
+.rm-mark { position: absolute; left: 6px; bottom: 6px; display: inline-flex; align-items: center; gap: 4px; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: rgb(0 0 0 / .55); color: #fff; }
+.rm-tile:has(input:checked) { outline: 3px solid var(--danger, #c0392b); outline-offset: -3px; }
+.rm-tile:has(input:checked) img, .rm-tile:has(input:checked) .vid-tile { opacity: .45; }
+.rm-tile:has(input:checked) .rm-mark { background: var(--danger, #c0392b); }
+.rm-tile:has(input:focus-visible) { outline: 3px solid var(--brand); outline-offset: -3px; }
+.v-del { color: inherit; }

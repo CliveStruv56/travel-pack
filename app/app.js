@@ -1089,7 +1089,7 @@ function viewerFor(f, ctx) {
   return html`<div class="viewer">
     <header class="v-top"><a class="icon-btn" href="${ctx.back}" aria-label="Close">${icon('x')}</a>
       <div class="v-title"><b>${ctx.title}</b><small>${ctx.sub}${ctx.siblings.length > 1 ? ` · ${pos + 1} of ${ctx.siblings.length}` : ''}</small></div>
-      ${!readOnly() ? html`<button class="icon-btn" data-act="del-file" data-file="${f.id}" aria-label="Delete">${icon('trash')}</button>` : ''}</header>
+      ${!readOnly() ? html`<button class="btn xs ghost v-del" data-act="del-file" data-file="${f.id}" aria-label="Delete this ${fileNoun(f)}">${icon('trash', 'sm')} Delete</button>` : ''}</header>
     <div class="v-body ${crop ? 'crop' : ''}" ${isVideo(f) ? '' : raw('data-act="toggle-crop"')}>
       ${isVideo(f) ? html`<video class="v-video" src="${fileUrl(f)}" controls playsinline preload="metadata"></video>${f.localOnly ? html`<p class="hint v-note">Too large to share (over ${fmtBytes(VIDEO_SYNC_LIMIT)}): kept on this phone only.</p>` : ''}`
       : img ? (crop ? html`<canvas data-crop="${f.id}" aria-label="Barcode"></canvas>` : html`<img src="${fileUrl(f)}" alt="">`)
@@ -1282,6 +1282,7 @@ const journalPhotos = (t, date) => {
 };
 
 const isVideo = (f) => !!f?.type?.startsWith('video/');
+const fileNoun = (f) => (f?.itemId?.startsWith('j_') ? (isVideo(f) ? 'video' : 'photo') : f?.tripId === DOCS ? 'file' : 'ticket');
 
 /** A journal photo or video as a still tile. Videos show their first frame and a play badge. */
 function mediaTile(f) {
@@ -2258,7 +2259,8 @@ const ACT = {
   async 'del-file'(el) {
     const f = anyFile(el.dataset.file);
     closeSheet();
-    if (!(await confirmBox('Delete this ticket?'))) return;
+    const what = fileNoun(f);
+    if (!(await confirmBox(`Delete this ${what}?${f.itemId?.startsWith('j_') && S.synced[f.tripId] ? ' It is removed from shared phones too.' : ''}`, 'Delete'))) return;
     closeSheet();
     await db.del('files', f.id);
     if (f.tripId === DOCS) {
@@ -2271,7 +2273,7 @@ const ACT = {
     const t = trip();
     tombstone(t, f.id);
     await saveTrip(t, { quiet: true });
-    toast('Ticket deleted');
+    toast(`${what.charAt(0).toUpperCase()}${what.slice(1)} deleted`);
     go(f.itemId.startsWith('j_') ? `journal/${t.journal.find((j) => j.id === f.itemId)?.date || ''}` : `item/${f.itemId}`);
   },
   async 'toggle-todo'(el) {
@@ -2655,11 +2657,22 @@ Object.assign(ACT, {
   'journal-edit': (el) => {
     const t = trip();
     const j = t.journal.find((x) => x.id === el.dataset.id);
+    const media = S.files.filter((f) => f.itemId === j.id);
     openSheet({
       title: 'Edit entry',
-      body: html`<label class="fld"><span>Entry</span><textarea name="text" rows="6">${j.text || ''}</textarea></label>`,
-      extra: html`<button type="button" class="btn danger-ghost" data-act="journal-del" data-id="${j.id}">Delete</button>`,
-      onSubmit: async (fd) => { j.text = String(fd.get('text') || '').trim(); closeSheet(); await saveTrip(t); },
+      body: html`<label class="fld"><span>Entry</span><textarea name="text" rows="6">${j.text || ''}</textarea></label>
+        ${media.length ? html`<div class="fld"><span>Photos & videos <small>tick any to remove</small></span>
+          <div class="rm-grid">${media.map((f) => html`<label class="rm-tile">${mediaTile(f)}<input type="checkbox" name="remove" value="${f.id}" aria-label="Remove this ${fileNoun(f)}"><span class="rm-mark">${icon('trash', 'sm')} Remove</span></label>`)}</div></div>` : ''}`,
+      extra: html`<button type="button" class="btn danger-ghost" data-act="journal-del" data-id="${j.id}">Delete entry</button>`,
+      onSubmit: async (fd) => {
+        j.text = String(fd.get('text') || '').trim();
+        const gone = new Set(fd.getAll('remove').map(String));
+        for (const f of media.filter((x) => gone.has(x.id))) { await db.del('files', f.id); tombstone(t, f.id); }
+        S.files = S.files.filter((x) => !gone.has(x.id));
+        closeSheet();
+        await saveTrip(t);
+        if (gone.size) toast(`${gone.size} removed`);
+      },
     });
   },
   async 'journal-del'(el) {

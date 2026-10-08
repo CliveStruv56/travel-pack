@@ -363,9 +363,36 @@ await section('Journal', async () => {
   await p.click('.journal-entry .vid-tile');
   await p.waitForSelector('.viewer video.v-video[controls]');
   ok(!(await p.$('.viewer .v-body[data-act]')), 'video plays in the viewer with its own controls');
+  // Delete from the viewer: a labelled button, worded for what it is.
+  await shot(p, '10-journal-video-viewer', false);
+  ok((await p.textContent('.viewer [data-act=del-file]')).includes('Delete'), 'viewer has a labelled Delete button');
+  await p.click('.viewer [data-act=del-file]');
+  await p.waitForSelector('.sheet-panel .btn.primary.danger');
+  ok((await p.textContent('.sheet-panel')).includes('Delete this video?'), 'confirmation names a video, not a ticket');
+  await p.click('.sheet-panel .btn.primary.danger');
+  await p.waitForSelector('form[data-form=journal]');
+  ok(await p.evaluate(() => !window.__tp.S.files.some((f) => f.type === 'video/mp4') && Object.keys(window.__tp.S.trips[0].deleted || {}).some((k) => k.startsWith('f_'))), 'video deleted, and recorded so shared phones drop it too');
+  ok(!(await p.$('.journal-entry .vid-tile')), 'video gone from the journal');
+
+  // Remove photos from the entry's Edit sheet.
+  const before = await p.$$eval('.journal-entry .photo-grid a', (a) => a.length);
+  await p.click('.journal-entry:nth-of-type(2) [data-act=journal-edit]');
+  await p.waitForSelector('.sheet-panel .rm-tile');
+  await shot(p, '11-journal-edit-remove', false);
+  const tiles = await p.$$('.sheet-panel .rm-tile');
+  ok(tiles.length === 2, 'Edit shows the entry\'s photos with Remove');
+  await tiles[0].click();
+  ok(await p.isChecked('.sheet-panel .rm-tile:first-child input'), 'tapping a photo marks it for removal');
+  await p.click('.sheet-panel .btn.primary');
+  await p.waitForFunction((n) => document.querySelectorAll('.journal-entry .photo-grid a').length === n - 1, before);
+  ok(true, 'ticked photo removed when the entry is saved; the others stay');
+  // A video for the sharing test later on.
+  await p.setInputFiles('form[data-form=journal] input[name=video]', { name: 'puffins.mp4', mimeType: 'video/mp4', buffer: Buffer.alloc(4096, 2) });
+  await p.click('form[data-form=journal] button.primary');
+  await p.waitForSelector('.journal-entry .vid-tile video', { state: 'attached' });
   await p.goto(at('2030-05-09T21:00', 'today'));
   await p.waitForSelector('a.tip[href^="#/journal/"]');
-  ok((await p.$$('.jn-strip img')).length >= 3, "Today's journal card shows the day's photos");
+  ok((await p.$$('.jn-strip img')).length >= 2 && (await p.$$('.jn-strip .vid-tile')).length === 1, "Today's journal card shows the day's photos and videos");
   await shot(p, '09-journal');
 });
 
