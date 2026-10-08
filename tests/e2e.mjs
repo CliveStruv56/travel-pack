@@ -532,6 +532,19 @@ await section('Server: live sharing between two phones, AI, Gmail', async () => 
   await p.click('[data-act=gmail-connect]');
   await p.waitForSelector('.mail-row', { timeout: 10000 });
   ok((await p.textContent('.mail-row')).includes('Booking confirmed'), 'Gmail connected and recent bookings listed');
+  // A question typed into email search is offered to the assistant instead.
+  await p.fill('form[data-form=email-search] input[name=q]', 'When do I leave Sanday?');
+  await p.click('form[data-form=email-search] button');
+  await p.waitForSelector('[data-act=email-to-ask]');
+  ok(true, 'a question in email search offers the assistant');
+  await p.click('[data-act=email-to-ask]');
+  await p.waitForFunction(() => location.hash === '#/ask' && document.querySelectorAll('.bubble.assistant').length >= 2, null, { timeout: 10000 });
+  ok(await p.$$eval('.bubble', (b) => b.some((x) => x.textContent.includes('When do I leave Sanday?'))), 'and asks it there');
+  await p.goto(at('2030-05-08T12:00', 'email'));
+  await p.fill('form[data-form=email-search] input[name=q]', 'Premier Inn');
+  await p.click('form[data-form=email-search] button');
+  await p.waitForSelector('.mail-row');
+  ok(!(await p.$('[data-act=email-to-ask]')), 'an ordinary search is left alone');
   await p.click('.mail-row');
   await p.waitForSelector('.mail-body');
   ok((await p.textContent('.mail-body')).includes('SMP777'), 'email opens');

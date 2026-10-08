@@ -114,17 +114,42 @@ function finalText(res) {
   return blocks.slice(start).filter((b) => b.type === 'text').map((b) => b.text).join('');
 }
 
+/** Anthropic's own explanation from an SDK error, without the status/JSON wrapping. */
+export function apiErrorMessage(e) {
+  return e?.error?.error?.message || e?.error?.message || String(e?.message || e).replace(/^\d{3}\s+/, '');
+}
+
+/** Turn a failed Claude call into an error a traveller can act on, and log the detail. */
+function explain(e) {
+  const msg = apiErrorMessage(e);
+  console.error(`Claude API error ${e?.status || ''}${e?.requestID ? ` (${e.requestID})` : ''}: ${msg}`);
+  if (/credit balance/i.test(msg)) return httpError(402, 'The Anthropic account behind the assistant has no credit. Add some under Billing at console.anthropic.com.');
+  if (e?.status === 401) return httpError(503, 'The server\'s Anthropic API key was refused. Check ANTHROPIC_API_KEY.');
+  if (e?.status === 429 || e?.status === 529 || e?.status >= 500) return httpError(503, 'The assistant is busy right now. Try again in a minute.');
+  return httpError(502, `The assistant could not answer: ${msg}`);
+}
+
+// Refusal fallbacks are a beta; an account without it gets a 400 naming the
+// header or the parameter. The request still works without them.
+const fallbackUnavailable = (e) => e?.status === 400 && /anthropic-beta|fallback/i.test(apiErrorMessage(e));
+
 async function callJson({ system, content, schema, effort, maxTokens = 16000 }) {
   const c = await client();
-  const res = await c.beta.messages.create({
+  const body = {
     model: MODEL,
     max_tokens: maxTokens,
-    betas: ['server-side-fallback-2026-07-01'],
-    fallbacks: 'default',
     system,
     output_config: { effort, format: { type: 'json_schema', schema } },
     messages: [{ role: 'user', content }],
-  });
+  };
+  let res;
+  try {
+    res = await c.beta.messages.create({ ...body, betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' });
+  } catch (e) {
+    if (!fallbackUnavailable(e)) throw explain(e);
+    console.warn(`Refusal fallback unavailable, retrying without it: ${apiErrorMessage(e)}`);
+    try { res = await c.messages.create(body); } catch (e2) { throw explain(e2); }
+  }
   if (res.stop_reason === 'refusal') throw httpError(422, 'The AI declined to read this.');
   if (res.stop_reason === 'max_tokens') throw httpError(502, 'The AI ran out of room before finishing. Try a shorter extract.');
   try {

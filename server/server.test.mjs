@@ -258,6 +258,34 @@ test('AI: refusal and unreadable output become clear errors', async () => {
   void real;
 });
 
+test('AI: API rejections become plain messages; a missing fallback beta is retried without it', async () => {
+  const apiErr = (status, message) => Object.assign(new Error(`${status} {"type":"error"}`), { status, error: { type: 'error', error: { type: 'invalid_request_error', message } } });
+  const quiet = console.error; const warn = console.warn; console.error = () => {}; console.warn = () => {};
+  try {
+    ai.setClient({ beta: { messages: { create: async () => { throw apiErr(400, 'Your credit balance is too low to access the Anthropic API.'); } } } });
+    let r = await call('/api/ai/chat', { method: 'POST', body: { trip: {}, messages: [{ role: 'user', content: 'hi' }] } });
+    assert.equal(r.status, 402);
+    assert.match((await r.json()).error, /no credit/);
+
+    let plain = null;
+    ai.setClient({
+      beta: { messages: { create: async () => { throw apiErr(400, 'Unexpected value(s) `server-side-fallback-2026-07-01` for the `anthropic-beta` header.'); } } },
+      messages: { create: async (params) => { plain = params; return { stop_reason: 'end_turn', content: [{ type: 'text', text: '{"reply":"Leave at 14:52.","changes":[]}' }] }; } },
+    });
+    r = await call('/api/ai/chat', { method: 'POST', body: { trip: {}, messages: [{ role: 'user', content: 'hi' }] } });
+    assert.equal((await r.json()).reply, 'Leave at 14:52.');
+    assert.ok(plain && !('fallbacks' in plain) && !('betas' in plain), 'retried without the beta');
+
+    ai.setClient({ beta: { messages: { create: async () => { throw apiErr(400, 'output_config.format.schema: something odd'); } } } });
+    r = await call('/api/ai/chat', { method: 'POST', body: { trip: {}, messages: [{ role: 'user', content: 'hi' }] } });
+    assert.equal(r.status, 502);
+    assert.equal((await r.json()).error, 'The assistant could not answer: output_config.format.schema: something odd');
+  } finally {
+    console.error = quiet; console.warn = warn;
+    ai.setClient(fakeClaude);
+  }
+});
+
 test('Gmail: sign-in round trip, search, read, attachment', async () => {
   assert.equal((await (await call('/api/me')).json()).gmail.connected, false);
   const { url } = await (await call('/api/gmail/start')).json();

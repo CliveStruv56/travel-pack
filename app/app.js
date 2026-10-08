@@ -1635,6 +1635,9 @@ VIEWS.sync = (t) => {
 const DEFAULT_EMAIL_Q = 'newer_than:90d (booking OR reservation OR confirmation OR e-ticket OR itinerary OR invoice)';
 const EMAIL_CHIPS = ['Premier Inn', 'Loganair', 'NorthLink', 'Trainline', 'booking confirmation', 'has:attachment ticket'];
 
+/** "When do I leave Aberdeen?" is a question for the assistant, not a Gmail search. */
+const looksLikeQuestion = (q) => /\?\s*$/.test(q || '') || /^(when|what|where|which|how|who|why|can|could|should|do|does|is|are|am|will|tell me)\b/i.test((q || '').trim());
+
 async function emailSearch(q) {
   S.email = { ...S.email, q, busy: true, error: '' };
   render();
@@ -1662,7 +1665,9 @@ VIEWS.email = (t) => {
   }
   if (S.email.results == null && !S.email.busy && !S.email.error && S.online && a) setTimeout(() => emailSearch(''), 0);
   const r = S.email.results || [];
+  const question = looksLikeQuestion(S.email.q);
   return html`${head}<div class="page">
+    ${question && a?.ai && t && !t.readOnly ? html`<button class="card tip" data-act="email-to-ask">${icon('sparkle')}<div><b>That looks like a question</b><span>Search email only finds matching emails. Ask the assistant instead: it answers from your trip plan.</span></div>${icon('right', 'sm dim')}</button>` : ''}
     <form class="search" data-form="email-search" role="search"><input name="q" value="${S.email.q}" placeholder="Search Gmail (e.g. Premier Inn)" aria-label="Search email"><button class="btn primary" aria-label="Search">${icon('scan')}</button></form>
     <div class="chips">${EMAIL_CHIPS.map((c) => html`<button class="chip-link" data-act="email-chip" data-q="${c}">${c}</button>`)}</div>
     ${S.email.busy ? html`<div class="slim quiet"><span class="spinner"></span><span>Searching…</span></div>` : ''}
@@ -2819,6 +2824,7 @@ Object.assign(ACT, {
     } catch (e) { toast(e.message); }
   },
   'email-chip': (el) => emailSearch(el.dataset.q),
+  'email-to-ask': () => { const q = S.email.q; go('ask'); setTimeout(() => askAssistant(q), 0); },
   'ai-email': (el) => runExtract('/api/ai/extract-email', { messageId: el.dataset.id }, 'email'),
   'mail-save': (el) => {
     const t = trip();
