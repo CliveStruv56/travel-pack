@@ -26,6 +26,7 @@ Personal **documents** (passport, insurance…) never leave the phone and are ne
 | `ANTHROPIC_API_KEY` | enables the AI features |
 | `GOOGLE_CLIENT_ID`, `GOOGLE_CLIENT_SECRET` | enable Gmail search (see below) |
 | `AI_CALLS_PER_HOUR` | optional per-person cap on AI calls, default 60 |
+| `VAPID_SUBJECT` | optional contact for push services (defaults to `APP_URL`) |
 
 On Railway also set `NPM_CONFIG_OMIT=dev` and `PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1`, so the
 build doesn't install the test browser.
@@ -81,3 +82,29 @@ USERS=me:devtoken SESSION_SECRET=dev ALLOWED_ORIGINS=http://localhost:5173 npm r
 npm start   # the app, in another terminal
 npm run connect-link -- http://localhost:5173/ http://localhost:8787 me devtoken
 ```
+
+## Reminders and the morning briefing
+
+Each phone turns reminders on under **More → Reminders & morning briefing**. The
+server checks once a minute and sends a Web Push notification:
+
+- before each flight and ferry (2 hours), train (1 hour), bus (45 min) and lift (30 min);
+- an hour before hotel check-out;
+- a morning briefing at the chosen time (default 07:30) on each trip day.
+
+Times are read as UK local time (BST handled). Reminders come from the server's
+copy of a trip, so only trips that are shared live get them, and each person
+only gets reminders for trips they can see. A reminder more than 30 minutes late
+(the server was down) is skipped, never sent late.
+
+Nothing to configure: the server makes its VAPID key pair on first start and
+keeps it in the database. Push is implemented with `node:crypto` (RFC 8291
+encryption, RFC 8292 VAPID), checked against the RFC's worked example in
+`server/push.test.mjs`. Subscriptions may only point at real browser push
+services (Google, Mozilla, Apple, Microsoft), so the server can't be made to
+POST anywhere else.
+
+The briefing card on Today is written by the assistant (`/api/ai/briefing`, low
+effort) from the day's bookings and the forecast the phone already holds. It is
+written once per day, after the first sync, and offers a rewrite if the day's
+bookings change.

@@ -15,6 +15,9 @@ export function openDb(path = process.env.DB_PATH || './data/travel-pack.db') {
     CREATE TABLE IF NOT EXISTS gmail (user TEXT PRIMARY KEY, refresh_token TEXT NOT NULL, email TEXT, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS members (id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL UNIQUE, trips TEXT NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS invites (code_hash TEXT PRIMARY KEY, trip_id TEXT NOT NULL, name TEXT NOT NULL, created_by TEXT NOT NULL, expires_at TEXT NOT NULL, used_at TEXT, used_by TEXT);
+    CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS push_subs (endpoint TEXT PRIMARY KEY, user_id TEXT NOT NULL, keys TEXT NOT NULL, prefs TEXT NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS push_sent (key TEXT PRIMARY KEY, at TEXT NOT NULL);
   `);
   const q = {
     tripList: db.prepare('SELECT id, data, rev, updated_at FROM trips ORDER BY updated_at DESC'),
@@ -36,10 +39,20 @@ export function openDb(path = process.env.DB_PATH || './data/travel-pack.db') {
     memberTrips: db.prepare('UPDATE members SET trips = ? WHERE id = ?'),
     inviteAdd: db.prepare('INSERT INTO invites (code_hash, trip_id, name, created_by, expires_at) VALUES (?, ?, ?, ?, ?)'),
     inviteGet: db.prepare('SELECT trip_id, name, created_by, expires_at, used_at FROM invites WHERE code_hash = ?'),
+    kvGet: db.prepare('SELECT value FROM kv WHERE key = ?'),
+    kvSet: db.prepare('INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'),
+    subPut: db.prepare('INSERT INTO push_subs (endpoint, user_id, keys, prefs, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(endpoint) DO UPDATE SET user_id = excluded.user_id, keys = excluded.keys, prefs = excluded.prefs'),
+    subGet: db.prepare('SELECT endpoint, user_id, keys, prefs FROM push_subs WHERE endpoint = ?'),
+    subList: db.prepare('SELECT endpoint, user_id, keys, prefs FROM push_subs'),
+    subDel: db.prepare('DELETE FROM push_subs WHERE endpoint = ?'),
+    sentGet: db.prepare('SELECT 1 FROM push_sent WHERE key = ?'),
+    sentPut: db.prepare('INSERT OR IGNORE INTO push_sent (key, at) VALUES (?, ?)'),
+    sentPrune: db.prepare('DELETE FROM push_sent WHERE at < ?'),
     inviteUse: db.prepare('UPDATE invites SET used_at = ?, used_by = ? WHERE code_hash = ? AND used_at IS NULL'),
   };
   const member = (r) => (r ? { id: r.id, name: r.name, trips: JSON.parse(r.trips) } : null);
   const now = () => new Date().toISOString();
+  const sub = (r) => (r ? { endpoint: r.endpoint, userId: r.user_id, keys: JSON.parse(r.keys), prefs: JSON.parse(r.prefs) } : null);
   return {
     listTrips: () => q.tripList.all().map((r) => ({ trip: JSON.parse(r.data), rev: r.rev, updatedAt: r.updated_at })),
     getTrip(id) {
@@ -73,6 +86,15 @@ export function openDb(path = process.env.DB_PATH || './data/travel-pack.db') {
     },
     /** True only for the first caller: an invite can be used once. */
     useInvite: (hash, by) => q.inviteUse.run(now(), by, hash).changes === 1,
+    getKv: (k) => { const r = q.kvGet.get(k); return r ? JSON.parse(r.value) : null; },
+    setKv: (k, v) => q.kvSet.run(k, JSON.stringify(v)),
+    putSub: (endpoint, userId, keys, prefs) => q.subPut.run(endpoint, userId, JSON.stringify(keys), JSON.stringify(prefs), now()),
+    getSub: (endpoint) => sub(q.subGet.get(endpoint)),
+    listSubs: () => q.subList.all().map(sub),
+    deleteSub: (endpoint) => q.subDel.run(endpoint),
+    wasSent: (key) => !!q.sentGet.get(key),
+    markSent: (key, at = now()) => q.sentPut.run(key, at),
+    pruneSent: (before) => q.sentPrune.run(before),
     close: () => db.close(),
   };
 }

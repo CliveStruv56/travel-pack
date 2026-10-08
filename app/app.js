@@ -8,7 +8,7 @@ import {
 import { tripToIcs, googleCalendarUrl } from './ics.js';
 import { shareLink, readShareLink, readAddLink, shareText, exportBundle, parseBundle } from './share.js';
 import { api, loadServer, getServer, setServer, readConnectLink, joinLink, readJoinLink, redeemInvite } from './api.js';
-import { stampChanges, tombstone, mergeTrips, forServer, sameContent } from './merge.js';
+import { stampChanges, tombstone, mergeTrips, forServer, sameContent, canon } from './merge.js';
 import { geocode, forecast, daily, hourly, legRisk, isWeatherSensitive, describeCode } from './weather.js';
 
 const APP_VERSION = '2.0.0';
@@ -49,6 +49,10 @@ const S = {
   ai: null,             // last AI extraction, waiting for review
   aiBusy: '',
   email: { q: '', results: null, msg: null, busy: false, error: '' },
+  push: { endpoint: '', prefs: null, upcoming: null, busy: false },  // reminders on this phone
+  briefs: {},           // "tripId:date" → { data, sig, at } morning briefings
+  briefBusy: '',
+  hidden: {},           // tips and cards dismissed on this phone
 };
 
 const qs = new URLSearchParams(location.search);
@@ -88,6 +92,8 @@ async function loadAll() {
   S.synced = (await db.get('meta', 'synced')) || {};
   S.docs = (await db.get('meta', 'docs')) || [];
   S.installHint = !!(await db.get('meta', 'installHint')) && !isStandalone();
+  S.hidden = (await db.get('meta', 'hidden')) || {};
+  S.push.prefs = (await db.get('meta', 'pushPrefs')) || null;
   for (const t of S.trips) S.snap.set(t.id, structuredClone(t));
   await loadServer();
   if (!S.trips.find((t) => t.id === S.tripId)) S.tripId = pickDefaultTrip()?.id || null;
@@ -196,6 +202,7 @@ async function onRoute() {
   if (S.route.name === 'add' && !S.incoming) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
   if (S.route.name === 'shared' && !S.preview) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
   if (S.route.name === 'sync') { S.serverTrips = null; loadServerTrips(); }
+  if (S.route.name === 'reminders') refreshPush();
   if (S.route.name === 'join' && !S.incomingJoin) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
   if (S.route.name === 'connect' && !S.incomingConnect) { history.replaceState(null, '', '#/today'); S.route = parseRoute(); }
   if (S.route.name === 'inbox') await refreshInbox();
@@ -429,6 +436,8 @@ VIEWS.today = (t) => {
   return html`${topBar(t)}<div class="page">
     ${roBanner(t)}
     ${install}
+    ${briefingCard(t, today)}
+    ${remindersTip(t, today)}
     ${before ? html`<div class="countdown"><span class="cd-n">${daysBetween(today, t.start)}</span><span class="cd-l">day${daysBetween(today, t.start) === 1 ? '' : 's'} to go<br><small>${fmtLongDay(t.start)}</small></span></div>` : ''}
     ${after ? html`<div class="card done-card">${icon('check')}<div><h3>Trip complete</h3><p>Welcome home. The plan and tickets stay here until you delete the trip.</p></div></div>` : ''}
     ${live ? hero(live, 'On the move · arrives', live.until) : ''}
@@ -845,6 +854,7 @@ VIEWS.more = (t) => {
       ${getServer() ? html`
         ${S.account?.ai && t && !ro ? link('#/ask', 'sparkle', 'Ask Travel Pack', 'Questions about the trip, or changes in plain English') : ''}
         ${S.account?.gmail?.available ? link('#/email', 'message', 'Search email', S.account.gmail.connected ? `Gmail · ${S.account.gmail.email || 'connected'}` : 'Connect Gmail to find bookings') : ''}
+        ${link('#/reminders', 'bell', 'Reminders & morning briefing', S.push.endpoint ? 'On for this phone' : 'Get a nudge before each departure')}
         ${link('#/sync', 'refresh', 'Live sharing & server', t && S.synced[t.id] ? 'This trip is shared live' : `Connected as ${getServer().name}`)}`
         : link('#/sync', 'refresh', 'Live sharing, AI & email', 'Connect this phone to your Travel Pack server')}
     </div>
@@ -2530,6 +2540,12 @@ const CHANGE = {
     el.value = '';
     if (files.length) await addDocFiles(el.dataset.id, files);
   },
+  async 'push-pref'(el) {
+    const f = el.closest('form');
+    const prefs = { departures: f.departures.checked, briefing: f.briefing.checked, briefingTime: f.briefingTime.value || PUSH_DEFAULTS.briefingTime };
+    try { await savePushPrefs(prefs); if (S.push.endpoint) { toast('Saved'); refreshPush(); } }
+    catch (e) { toast(e.message); }
+  },
   'journal-photos'(el) {
     const form = el.closest('form');
     const box = form.querySelector('.jn-previews');
@@ -2633,7 +2649,156 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
     setInterval(() => reg.update().catch(() => {}), 3600000);
   }).catch(() => {});
   let reloading = false;
+  // A tapped reminder opens the matching page in the app that is already open.
+  navigator.serviceWorker.addEventListener('message', (e) => { if (e.data?.nav) location.hash = e.data.nav; });
+  navigator.serviceWorker.ready.then(async (reg) => {
+    const sub = await reg.pushManager?.getSubscription().catch(() => null);
+    S.push.endpoint = sub?.endpoint || '';
+  }).catch(() => {});
   navigator.serviceWorker.addEventListener('controllerchange', () => { if (!reloading && S.updateReady) { reloading = true; location.reload(); } });
+}
+
+/* =====================================================================
+   Reminders (Web Push) and the morning briefing
+   ===================================================================== */
+
+const pushSupported = () => 'serviceWorker' in navigator && 'PushManager' in window && 'Notification' in window;
+const PUSH_DEFAULTS = { departures: true, briefing: true, briefingTime: '07:30' };
+const pushPrefs = () => ({ ...PUSH_DEFAULTS, ...(S.push.prefs || {}) });
+const b64uBytes = (s) => Uint8Array.from(atob(s.replace(/-/g, '+').replace(/_/g, '/')), (c) => c.charCodeAt(0));
+
+async function refreshPush() {
+  if (!pushSupported()) return;
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription().catch(() => null);
+  S.push.endpoint = sub?.endpoint || '';
+  S.push.upcoming = null;
+  render();
+  if (S.push.endpoint && getServer() && navigator.onLine) {
+    try { S.push.upcoming = await api('/api/push/upcoming', { method: 'POST', body: { endpoint: S.push.endpoint } }); }
+    catch (e) { if (e.status === 404) S.push.endpoint = ''; S.push.upcoming = []; }
+    if (S.route.name === 'reminders') render();
+  }
+}
+
+async function savePushPrefs(prefs) {
+  S.push.prefs = prefs;
+  await db.put('meta', prefs, 'pushPrefs');
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription();
+  if (sub) await api('/api/push/subscribe', { method: 'POST', body: { subscription: sub.toJSON(), prefs } });
+}
+
+const fmtWhen = (iso) => new Date(iso).toLocaleString('en-GB', { timeZone: 'Europe/London', weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' });
+
+VIEWS.reminders = (t) => {
+  const head = subBar('Reminders & briefing', 'more');
+  const p = pushPrefs();
+  if (!getServer()) return html`${head}<div class="page"><div class="card tip static">${icon('info')}<div><b>Connect to your server first</b><span>Reminders are sent by your Travel Pack server, so they arrive even when the app is closed.</span></div></div><a class="btn wide" href="#/sync">Live sharing & server</a></div>`;
+  if (!pushSupported()) {
+    return html`${head}<div class="page"><div class="card tip static">${icon('info')}<div><b>This browser can't show reminders</b><span>${isIos() && !isStandalone() ? 'On iPhone, add Travel Pack to your home screen first (Share → Add to Home Screen), then open it from there.' : 'Open Travel Pack in Chrome, or from your home screen.'}</span></div></div></div>`;
+  }
+  const denied = Notification.permission === 'denied';
+  const on = !!S.push.endpoint;
+  const shared = t && S.synced[t.id];
+  return html`${head}<form class="page form" data-form="push-prefs" onsubmit="return false">
+    <p class="lead">A notification before each flight, ferry and train, a check-out reminder, and a short briefing each morning of the trip. They come from your server, so they arrive even when the app is closed.</p>
+    ${t && !t.readOnly && !shared ? html`<div class="banner warn">${icon('alert', 'sm')}<div><b>${t.name} isn't shared live yet</b><span>Reminders are worked out on the server from the shared copy of the trip.</span></div><button type="button" class="btn xs" data-act="sync-on">Share it</button></div>` : ''}
+    ${denied ? html`<div class="banner warn">${icon('alert', 'sm')}<div><b>Notifications are blocked</b><span>Allow them for Travel Pack in Android Settings → Apps → Travel Pack → Notifications (or in the browser's site settings), then come back.</span></div></div>` : ''}
+    ${on ? html`<div class="card kvs"><div class="kv"><span>Reminders</span><b class="ok">${icon('check', 'sm')} On for this phone</b></div></div>`
+      : html`<button type="button" class="btn primary wide" data-act="push-on" ${denied || S.push.busy ? 'disabled' : ''}>${S.push.busy ? html`<span class="spinner"></span> Turning on…` : html`${icon('bell')} Turn on reminders`}</button>`}
+    <fieldset><legend>Send me</legend><div class="checks col">
+      <label class="check"><input type="checkbox" name="departures" data-change="push-pref" ${p.departures ? raw('checked') : ''}><span>Departure reminders<small class="sub">2 hours before flights and ferries, 1 hour before trains, and before check-out</small></span></label>
+      <label class="check"><input type="checkbox" name="briefing" data-change="push-pref" ${p.briefing ? raw('checked') : ''}><span>Morning briefing on trip days</span></label>
+    </div></fieldset>
+    <label class="fld"><span>Briefing time</span><input type="time" name="briefingTime" value="${p.briefingTime}" data-change="push-pref"></label>
+    ${on ? html`<button type="button" class="btn wide" data-act="push-test">${icon('bell')} Send a test notification</button>
+      <h2 class="sec-h">Coming up</h2>
+      <div class="card list-card">${S.push.upcoming == null ? html`<div class="row"><span class="row-main"><small>${S.online ? 'Loading…' : 'Needs signal'}</small></span></div>`
+        : S.push.upcoming.length ? S.push.upcoming.map((r) => html`<div class="row"><span class="row-ic">${icon('bell')}</span><span class="row-main"><b>${r.title}</b><small>${fmtWhen(r.at)} · ${r.body}</small></span></div>`)
+        : html`<div class="row"><span class="row-main"><small>Nothing scheduled. Share a trip live to get reminders for it.</small></span></div>`}</div>
+      <button type="button" class="btn danger-ghost wide" data-act="push-off">Turn off reminders on this phone</button>` : ''}
+    <p class="hint">Times are UK time. Reminders follow the shared trip, so a change made by Jane moves them too.</p>
+  </form>`;
+};
+
+/** Small tip on Today until reminders are on (or the tip is dismissed). */
+function remindersTip(t, today) {
+  if (!getServer() || !pushSupported() || S.push.endpoint || S.hidden.remindersTip || t.readOnly || today > t.end) return '';
+  return html`<div class="card tip">${icon('bell')}<div><b>Get a nudge before each departure</b><span>Reminders before flights, ferries and trains, and a morning briefing.</span>
+    <span class="row-btns"><a class="btn xs primary" href="#/reminders">Turn on</a><button class="btn xs ghost" data-act="hide" data-key="remindersTip">Not now</button></span></div></div>`;
+}
+
+/* ----- morning briefing ----- */
+
+const briefKey = (t, d) => `${t.id}:${d}`;
+/** What the briefing was written from: if any of it changes, offer a refresh. */
+const briefSig = (t, d) => canon(t.items.filter((i) => i.date === d || i.endDate === d).map(({ updatedAt, ...i }) => i));
+
+function briefingInputs(t, d) {
+  const places = [...new Set([placeOn(t, d), ...t.items.filter((i) => i.date === d && isTransport(i)).flatMap((i) => [i.from, i.to])].filter(Boolean))].slice(0, 5);
+  const weather = places.map((place) => {
+    const x = daily(wxFor(place), d);
+    return x ? { place, outlook: describeCode(x.code).label, maxC: x.max, minC: x.min, rainChance: x.rain, gustsMph: x.gusts } : null;
+  }).filter(Boolean);
+  const risks = t.items.filter((i) => i.date === d).map((i) => {
+    const r = riskFor(i);
+    return r && r.level ? { booking: itemTitle(i), time: i.time, risk: RISK_TEXT[r.level], reasons: r.reasons, planB: i.planB || '' } : null;
+  }).filter(Boolean);
+  return { weather, risks };
+}
+
+async function loadBriefing(tripOrId, d) {
+  // Always the latest copy: a sync may have replaced it since the page was drawn.
+  const t = S.trips.find((x) => x.id === (tripOrId.id || tripOrId));
+  if (!t) return;
+  const key = briefKey(t, d);
+  if (S.briefBusy === key) return;
+  S.briefBusy = key;
+  if (S.route.name === 'today') scheduleQuietRender();
+  const sig = briefSig(t, d);
+  try {
+    const data = await api('/api/ai/briefing', { method: 'POST', body: { trip: forServer(t), date: d, now: now().toISOString(), ...briefingInputs(t, d) }, timeout: 90000 });
+    S.briefs[key] = { data, sig, at: new Date().toISOString() };
+    await db.put('meta', S.briefs[key], 'brief:' + key);
+  } catch (e) {
+    S.briefs[key] = { ...(S.briefs[key] || {}), error: e.message };
+  }
+  S.briefBusy = '';
+  if (S.route.name === 'today') scheduleQuietRender();
+}
+
+const briefTried = new Set();
+
+function briefingCard(t, today) {
+  if (t.readOnly || today < t.start || today > t.end || S.hidden['brief:' + today] || !getServer() || !S.account?.ai) return '';
+  const key = briefKey(t, today);
+  if (!(key in S.briefs) && !briefTried.has('load:' + key)) {
+    briefTried.add('load:' + key);
+    db.get('meta', 'brief:' + key).then((b) => { if (b) { S.briefs[key] = b; scheduleQuietRender(); } });
+  }
+  const b = S.briefs[key];
+  // Written automatically once each morning, a moment after Today opens so the forecast has loaded.
+  // A shared trip waits for this session's first sync, so the briefing is written from the latest plan.
+  const synced = !S.synced[t.id] || S.sync.at || S.sync.state === 'error';
+  if (!b?.data && !b?.error && S.online && synced && now().getHours() >= 5 && !briefTried.has(key)) {
+    briefTried.add(key);
+    setTimeout(() => { if (S.route.name === 'today' && !S.briefs[key]?.data && !syncing[t.id]) loadBriefing(t.id, today); else briefTried.delete(key); }, 2500);
+  }
+  const busy = S.briefBusy === key;
+  const stale = b?.data && b.sig !== briefSig(t, today);
+  return html`<section class="card brief">
+    <div class="brief-head"><span class="tile">${icon('sparkle')}</span><div><b>Morning briefing</b><small>${fmtLongDay(today)}${b?.at && !busy ? ` · written ${hhmm(new Date(b.at))}` : ''}</small></div>
+      ${S.online && !busy ? html`<button class="icon-btn sm" data-act="brief-refresh" aria-label="Write it again">${icon('refresh')}</button>` : ''}
+      <button class="icon-btn sm" data-act="hide" data-key="brief:${today}" aria-label="Hide for today">${icon('x')}</button></div>
+    ${busy ? html`<div class="slim quiet"><span class="spinner"></span><span>Writing today's briefing…</span></div>`
+      : b?.data ? html`<h3>${b.data.headline}</h3><p>${b.data.summary}</p>
+        ${b.data.watch?.length ? html`<ul class="watch">${b.data.watch.map((w) => html`<li>${icon('alert', 'sm')}<span>${w}</span></li>`)}</ul>` : ''}
+        ${stale ? html`<button class="btn xs" data-act="brief-refresh">${icon('refresh', 'sm')} The plan changed: write it again</button>` : ''}`
+      : b?.error ? html`<p class="hint">Couldn't write the briefing: ${b.error}</p><button class="btn xs" data-act="brief-refresh">Try again</button>`
+      : html`<p class="hint">${S.online ? 'Your plan for today, the weather and anything to watch, written by the assistant.' : 'Needs signal to write.'}</p>${S.online ? html`<button class="btn xs primary" data-act="brief-refresh">Write today's briefing</button>` : ''}`}
+    <p class="fine">Written by Claude from your plan and the forecast. Check times with the operator.</p>
+  </section>`;
 }
 
 /* =====================================================================
@@ -2641,6 +2806,48 @@ if ('serviceWorker' in navigator && location.protocol !== 'file:') {
    ===================================================================== */
 
 Object.assign(ACT, {
+  async 'push-on'() {
+    S.push.busy = true;
+    render();
+    try {
+      const perm = await Notification.requestPermission();
+      if (perm !== 'granted') throw new Error('Notifications were not allowed.');
+      const { publicKey } = await api('/api/push/key');
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: b64uBytes(publicKey) });
+      const prefs = pushPrefs();
+      await api('/api/push/subscribe', { method: 'POST', body: { subscription: sub.toJSON(), prefs } });
+      await db.put('meta', prefs, 'pushPrefs');
+      S.push.endpoint = sub.endpoint;
+      toast('Reminders are on');
+      await api('/api/push/test', { method: 'POST', body: { endpoint: sub.endpoint } }).catch(() => {});
+    } catch (e) { toast(e.message || 'Could not turn reminders on.'); }
+    S.push.busy = false;
+    refreshPush();
+  },
+  async 'push-off'() {
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      const sub = await reg.pushManager.getSubscription();
+      if (sub) {
+        await api('/api/push/subscribe', { method: 'DELETE', body: { endpoint: sub.endpoint } }).catch(() => {});
+        await sub.unsubscribe();
+      }
+      S.push.endpoint = '';
+      toast('Reminders are off on this phone');
+    } catch (e) { toast(e.message); }
+    render();
+  },
+  async 'push-test'() {
+    try { await api('/api/push/test', { method: 'POST', body: { endpoint: S.push.endpoint } }); toast('Sent. It should appear in a few seconds.'); }
+    catch (e) { toast(e.message); }
+  },
+  async hide(el) {
+    S.hidden[el.dataset.key] = true;
+    await db.put('meta', S.hidden, 'hidden');
+    render();
+  },
+  'brief-refresh': () => { const t = trip(); loadBriefing(t, isoDate(now())); },
   'doc-sheet': (el) => docSheet(S.docs.find((d) => d.id === el.dataset.id)),
   'add-doc-files': (el) => { pendingDoc = el.dataset.id; fileInput.click(); },
   async 'del-doc'(el) {

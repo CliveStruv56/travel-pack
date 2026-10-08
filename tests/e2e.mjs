@@ -417,13 +417,22 @@ await section('Server: live sharing between two phones, AI, Gmail', async () => 
   Object.assign(process.env, { GOOGLE_CLIENT_ID: 'c', GOOGLE_CLIENT_SECRET: 's', PUBLIC_URL: SRV, GOOGLE_AUTH_URL: `${gu}/auth`, GOOGLE_TOKEN_URL: `${gu}/token`, GMAIL_API_BASE: `${gu}/gmail`, ANTHROPIC_API_KEY: 'test' });
   const item = { type: 'hotel', status: 'confirmed', title: 'Sample Harbour Hotel', provider: '', number: '', from: '', to: '', fromCode: '', toCode: '', date: '2030-05-15', time: '15:00', endDate: '2030-05-16', endTime: '11:00', seat: '', class: '', ref: 'SMP777', eticket: '', address: '', phone: '', keyTimes: '', notes: '', planB: '', costAmount: 80, costStatus: 'paid', costNote: '' };
   ai.setClient({ beta: { messages: { create: async (params) => {
+    if (params.output_config.format.schema.properties.headline) {
+      briefRequests.push(params);
+      return { stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify({ headline: 'Island hop and a night ferry', summary: 'Your Loganair flight leaves Sanday at 15:50.', watch: ['Gusts could disrupt the Sanday flight; Plan B is the ferry.'] }) }] };
+    }
     const chat = params.output_config.format.schema.properties.reply;
     const out = chat
       ? { reply: 'Your flight leaves Sanday at 15:50. I can move your seat.', changes: [{ action: 'update', itemId: 'it_lm0710', reason: 'Seat change', item: { ...item, type: 'flight', title: '', provider: 'Loganair', number: 'LM0710', from: 'Sanday', to: 'Kirkwall', date: '2030-05-08', time: '15:50', endDate: '2030-05-08', endTime: '16:11', seat: '1A', ref: 'SMP001', costAmount: 0, costStatus: 'none' } }] }
       : { summary: 'One hotel booking.', items: [{ updatesExistingId: '', item }] };
     return { stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify(out) }] };
   } } } });
-  const app = createApp({ db: openDb(':memory:'), users: 'clive:tok-clive,jane:tok-jane', secret: 'x', origins: BASE.replace(/\/$/, ''), appUrl: `${BASE}?now=2030-05-08T12:00` });
+  const pushed = [];
+  const briefRequests = [];
+  const app = createApp({
+    db: openDb(':memory:'), users: 'clive:tok-clive,jane:tok-jane', secret: 'x', origins: BASE.replace(/\/$/, ''), appUrl: `${BASE}?now=2030-05-08T12:00`,
+    pushHosts: /^push\.test$/, pushSend: async (sub, payload) => { pushed.push({ sub, payload }); return 'sent'; },
+  });
   srvHttp.on('request', app.handle);
   const link = (name, tok) => execFileSync('node', [new URL('../tools/make-connect-link.mjs', import.meta.url).pathname, `${BASE}?now=2030-05-08T12:00`, SRV, name, tok]).toString().trim();
 
@@ -572,6 +581,65 @@ await section('Server: live sharing between two phones, AI, Gmail', async () => 
   await p.click('form[data-form=email-search] button');
   await p.waitForSelector('.mail-row');
   ok(!(await p.$('[data-act=email-to-ask]')), 'an ordinary search is left alone');
+
+  // Morning briefing: written on its own when Today opens on a trip day.
+  await p.goto(at('2030-05-08T08:00', 'today'));
+  await p.waitForSelector('.brief h3', { timeout: 15000 });
+  ok((await p.textContent('.brief h3')).includes('Island hop'), 'morning briefing appears on Today');
+  ok((await p.textContent('.brief .watch')).includes('Plan B'), 'with the points to watch');
+  // It was first written on an earlier visit, before the assistant moved the seat to 1A.
+  ok(!!(await p.$('.brief .btn[data-act=brief-refresh]')), 'flags that the plan has changed since it was written');
+  const before = briefRequests.length;
+  await p.click('.brief .btn[data-act=brief-refresh]');
+  await p.waitForFunction((n) => document.querySelector('.brief h3') && !document.querySelector('.brief .btn[data-act=brief-refresh]') && true, before, { timeout: 15000 });
+  ok(briefRequests.length === before + 1 && /"seat":"1A"/.test(briefRequests.at(-1).messages[0].content[0].text), 'rewritten from the latest plan, and no longer flagged');
+  const br = briefRequests.at(-1);
+  ok(br && /briefing is for 2030-05-08/.test(br.system) && /Forecast for today's places:\n\[\{"place"/.test(br.messages[0].content[0].text), 'it is written from the day and the forecast');
+  await shot(p, '44-briefing');
+  const n = briefRequests.length;
+  await p.reload();
+  await p.waitForSelector('.brief h3');
+  await p.waitForTimeout(3000);
+  ok(briefRequests.length === n, 'kept for the day, not rewritten on every visit');
+  await p.click('.brief [data-act=hide]');
+  await p.waitForSelector('.brief', { state: 'detached', timeout: 5000 }).catch(() => {});
+  ok(!(await p.$('.brief')), 'can be hidden for the day');
+
+  // Reminders: turn on, get a test notification, change settings, turn off.
+  // Headless Chromium reports notifications as blocked: the page says how to fix it.
+  await p.goto(at('2030-05-08T08:00', 'reminders'));
+  await p.waitForSelector('[data-act=push-on][disabled]');
+  ok((await p.textContent('.banner.warn')).includes('Notifications are blocked'), 'blocked notifications are explained');
+  await p.addInitScript(() => {
+    Object.defineProperty(Notification, 'permission', { get: () => 'granted' });
+    let sub = null;
+    const make = () => ({ endpoint: 'https://push.test/sub/clive-phone', toJSON() { return { endpoint: this.endpoint, keys: { p256dh: 'BCVxsr7N_eNgVRqvHtD0zTZsEc6-VV-JvLexhqUzORcxaOzi6-AYWXvTBHm4bjyPjs7Vd8pZGH6SRpkNtoIAiw4', auth: 'BTBZMqHH6r4Tts7J_aSIgg' } }; }, async unsubscribe() { sub = null; return true; } });
+    PushManager.prototype.subscribe = async function (o) { if (!(o.applicationServerKey instanceof Uint8Array) || o.applicationServerKey.length !== 65) throw new Error('bad key'); sub = make(); return sub; };
+    PushManager.prototype.getSubscription = async () => sub;
+    Notification.requestPermission = async () => 'granted';
+  });
+  await p.goto(at('2030-05-08T08:00', 'more'));
+  await p.reload();
+  await p.click('a[href="#/reminders"]');
+  await p.waitForSelector('[data-act=push-on]');
+  await shot(p, '45-reminders-off');
+  await p.click('[data-act=push-on]');
+  await p.waitForSelector('.kv b.ok', { timeout: 10000 });
+  ok(pushed.some((x) => x.payload.title === 'Travel Pack reminders are on'), 'turning on sends a test notification through the server');
+  await p.waitForSelector('.list-card .row b', { timeout: 10000 });
+  ok((await p.textContent('.page')).includes('Flight at 15:50'), 'upcoming reminders are listed');
+  ok((await p.textContent('.page')).includes('Wed, 8 May, 13:50 · Leaves in 2 hours'), 'times shown in UK time');
+  await shot(p, '46-reminders-on');
+  await p.uncheck('input[name=briefing]');
+  await p.waitForTimeout(800);
+  ok(app.db.listSubs()[0]?.prefs.briefing === false, 'settings are saved to the server');
+  await p.click('[data-act=push-off]');
+  await p.waitForSelector('[data-act=push-on]');
+  ok(app.db.listSubs().length === 0, 'turning off removes the subscription');
+  await p.goto(at('2030-05-08T12:00', 'email'));
+  await p.fill('form[data-form=email-search] input[name=q]', 'Premier Inn');
+  await p.click('form[data-form=email-search] button');
+  await p.waitForSelector('.mail-row');
   await p.click('.mail-row');
   await p.waitForSelector('.mail-body');
   ok((await p.textContent('.mail-body')).includes('SMP777'), 'email opens');

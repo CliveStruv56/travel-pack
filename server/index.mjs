@@ -20,6 +20,12 @@ import { randomBytes } from 'node:crypto';
 import { mergeTrips, forServer, sameContent } from '../app/merge.js';
 import * as ai from './ai.mjs';
 import * as gm from './gmail.mjs';
+import * as push from './push.mjs';
+import { plan, due, DEFAULT_PREFS } from './reminders.mjs';
+
+// Push subscriptions may only point at real browser push services; anything
+// else would let a caller make this server POST to an address of their choice.
+const PUSH_HOSTS = /^(fcm\.googleapis\.com|android\.googleapis\.com|updates\.push\.services\.mozilla\.com|([a-z0-9-]+\.)*push\.apple\.com|([a-z0-9-]+\.)*notify\.windows\.com)$/;
 
 const JSON_LIMIT = 40 * 1024 * 1024;
 const FILE_LIMIT = 20 * 1024 * 1024;
@@ -56,6 +62,11 @@ export function createApp(opts = {}) {
   const aiLimit = rateLimiter(Number(process.env.AI_CALLS_PER_HOUR || 60));
   const redeemLimit = rateLimiter(20);
   const INVITE_DAYS = 7;
+  const pushHosts = opts.pushHosts || PUSH_HOSTS;
+  const pushSend = opts.pushSend || push.send;
+  const pushSubject = process.env.VAPID_SUBJECT || appUrl;
+  let vapid = null;
+  const keys = () => (vapid ||= push.vapidKeys(db));
   if (!users.length) console.warn('USERS is empty: every request will be refused.');
 
   const send = (res, status, body, headers = {}) => {
@@ -200,6 +211,89 @@ export function createApp(opts = {}) {
     return { token, name: who?.name || String(name || '').trim().slice(0, 40) || inv.name, tripId: inv.tripId, tripName: row.trip.name || '' };
   }, { auth: false });
 
+  /* ---------- reminders (Web Push) ---------- */
+
+  // Who a stored subscription belongs to, with the same trip visibility rules
+  // as a signed-in request.
+  const whoById = (id) => {
+    const u = users.find((x) => x.name === id);
+    if (u) return { id, name: id, all: true, trips: [] };
+    const m = db.getMember(id);
+    return m ? { ...m, all: false } : null;
+  };
+
+  const cleanPrefs = (p = {}) => ({
+    departures: p.departures !== false,
+    briefing: p.briefing !== false,
+    briefingTime: /^([01]\d|2[0-3]):[0-5]\d$/.test(p.briefingTime || '') ? p.briefingTime : DEFAULT_PREFS.briefingTime,
+  });
+
+  route('GET', /^\/api\/push\/key$/, () => ({ publicKey: keys().publicKey }));
+
+  route('POST', /^\/api\/push\/subscribe$/, async ({ req, who }) => {
+    const { subscription: s, prefs } = await readJson(req);
+    let host = '';
+    try { const u = new URL(s?.endpoint); host = u.protocol === 'https:' || pushHosts !== PUSH_HOSTS ? u.hostname : ''; } catch { /* not a URL */ }
+    if (!host || !pushHosts.test(host)) throw httpError(400, 'That is not a browser push address.');
+    if (!s.keys?.p256dh || !s.keys?.auth) throw httpError(400, 'The subscription has no keys.');
+    db.putSub(s.endpoint, who.id, { p256dh: s.keys.p256dh, auth: s.keys.auth }, cleanPrefs(prefs));
+    return { ok: true, prefs: cleanPrefs(prefs) };
+  });
+
+  const ownSub = (who, endpoint) => {
+    const s = db.getSub(String(endpoint || ''));
+    if (!s || s.userId !== who.id) throw httpError(404, 'Reminders are not turned on for this phone.');
+    return s;
+  };
+
+  route('DELETE', /^\/api\/push\/subscribe$/, async ({ req, who }) => {
+    const { endpoint } = await readJson(req);
+    ownSub(who, endpoint);
+    db.deleteSub(endpoint);
+    return { ok: true };
+  });
+
+  route('POST', /^\/api\/push\/test$/, async ({ req, who }) => {
+    const { endpoint } = await readJson(req);
+    const s = ownSub(who, endpoint);
+    const r = await pushSend(s, { title: 'Travel Pack reminders are on', body: 'You will get a nudge before each departure and a morning briefing on trip days.', url: '#/today', tag: 'test' }, keys(), { subject: pushSubject });
+    if (r === 'gone') db.deleteSub(s.endpoint);
+    if (r !== 'sent') throw httpError(502, 'The push service did not accept the message. Try turning reminders off and on again.');
+    return { ok: true };
+  });
+
+  /** The next reminders this phone will get, for the settings page. */
+  route('POST', /^\/api\/push\/upcoming$/, async ({ req, who }) => {
+    const { endpoint } = await readJson(req);
+    const s = ownSub(who, endpoint);
+    const now = Date.now();
+    return db.listTrips().filter(({ trip }) => canSee(who, trip.id))
+      .flatMap(({ trip }) => plan(trip, s.prefs)).filter((r) => r.at > now)
+      .sort((a, b) => a.at - b.at).slice(0, 8)
+      .map(({ at, title, body }) => ({ at: new Date(at).toISOString(), title, body }));
+  });
+
+  /** Send every reminder that has just become due. Called once a minute. */
+  async function tick(now = Date.now()) {
+    let sent = 0;
+    const trips = db.listTrips().map((r) => r.trip);
+    for (const s of db.listSubs()) {
+      const who = whoById(s.userId);
+      if (!who) { db.deleteSub(s.endpoint); continue; }
+      const mine = trips.filter((t) => canSee(who, t.id));
+      for (const r of due(mine.flatMap((t) => plan(t, s.prefs)), now)) {
+        const key = `${tokenHash(s.endpoint).slice(0, 16)}:${r.key}`;
+        if (db.wasSent(key)) continue;
+        const res = await pushSend(s, { title: r.title, body: r.body, url: r.url, tag: r.tag }, keys(), { subject: pushSubject });
+        // A failed send is retried next minute until it goes stale; a sent one never repeats.
+        if (res === 'sent') { db.markSent(key, new Date(now).toISOString()); sent++; }
+        if (res === 'gone') { db.deleteSub(s.endpoint); break; }
+      }
+    }
+    db.pruneSent(new Date(now - 60 * 86400000).toISOString());
+    return sent;
+  }
+
   /* ---------- AI ---------- */
 
   const guardAi = (user) => {
@@ -224,6 +318,11 @@ export function createApp(opts = {}) {
     }
     const text = `From: ${msg.from}\nDate: ${msg.date}\nSubject: ${msg.subject}\n\n${msg.text}`;
     return ai.extractBookings({ text, attachments, trip, source: 'email' });
+  });
+
+  route('POST', /^\/api\/ai\/briefing$/, async ({ req, user }) => {
+    guardAi(user);
+    return ai.morningBriefing(await readJson(req));
   });
 
   route('POST', /^\/api\/ai\/chat$/, async ({ req, user }) => {
@@ -307,7 +406,7 @@ export function createApp(opts = {}) {
     }
   }
 
-  return { handle, db };
+  return { handle, db, tick };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -316,4 +415,6 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const server = createServer(app.handle);
   server.requestTimeout = 20 * 60000; // a large video upload over a slow mobile connection
   server.listen(port, () => console.log(`Travel Pack server on :${port}`));
+  // Reminders: check once a minute for anything that has just become due.
+  setInterval(() => app.tick().catch((e) => console.error('Reminder tick failed', e)), 60000).unref();
 }

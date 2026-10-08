@@ -51,6 +51,9 @@ before(async () => {
     beta: { messages: { create: async (params) => {
       lastAiRequest = params;
       const isChat = params.output_config.format.schema.properties.reply;
+      if (params.output_config.format.schema.properties.headline) {
+        return { stop_reason: 'end_turn', content: [{ type: 'text', text: JSON.stringify({ headline: 'Island hop', summary: 'Flight at 15:50.', watch: [] }) }] };
+      }
       const out = isChat
         ? { reply: 'Leave at 06:45.', changes: [] }
         : { summary: 'One hotel.', items: [{ updatesExistingId: '', item: { type: 'hotel', status: 'confirmed', title: 'Sample Hotel', provider: '', number: '', from: '', to: '', fromCode: '', toCode: '', date: '2030-05-09', time: '15:00', endDate: '2030-05-11', endTime: '12:00', seat: '', class: '', ref: 'SMP123', eticket: '', address: '', phone: '', keyTimes: '', notes: '', planB: '', costAmount: 0, costStatus: 'none', costNote: '' } }] };
@@ -243,6 +246,17 @@ test('AI chat: needs a question and returns a reply', async () => {
   const r = await (await call('/api/ai/chat', { method: 'POST', body: { trip: baseTrip(), messages: [{ role: 'user', content: 'When do I leave?' }] } })).json();
   assert.equal(r.reply, 'Leave at 06:45.');
   assert.equal(lastAiRequest.output_config.effort, 'medium');
+});
+
+test('AI briefing: needs a day, sends the forecast and the plan, low effort', async () => {
+  assert.equal((await call('/api/ai/briefing', { method: 'POST', body: { trip: baseTrip() } })).status, 400);
+  const r = await (await call('/api/ai/briefing', { method: 'POST', body: { trip: baseTrip(), date: '2030-05-08', weather: [{ place: 'Sanday', gustsMph: 48 }], risks: [{ booking: 'A → B', risk: 'Weather could disrupt this leg' }] } })).json();
+  assert.equal(r.headline, 'Island hop');
+  assert.equal(lastAiRequest.output_config.effort, 'low');
+  const text = lastAiRequest.messages[0].content[0].text;
+  assert.match(text, /"gustsMph":48/);
+  assert.match(text, /Weather could disrupt this leg/);
+  assert.match(lastAiRequest.system, /briefing is for 2030-05-08/);
 });
 
 test('AI: refusal and unreadable output become clear errors', async () => {

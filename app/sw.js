@@ -6,7 +6,7 @@ const VERSION = 'tp-__BUILD__';
 const ASSETS = [
   './', './index.html', './styles.css', './app.js', './util.js', './db.js', './model.js',
   './icons.js', './ics.js', './share.js', './api.js', './merge.js', './weather.js', './manifest.webmanifest',
-  './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png',
+  './icons/icon-192.png', './icons/icon-512.png', './icons/maskable-512.png', './icons/badge-96.png',
 ];
 
 self.addEventListener('install', (e) => {
@@ -23,6 +23,28 @@ self.addEventListener('activate', (e) => {
 });
 
 self.addEventListener('message', (e) => { if (e.data === 'skipWaiting') self.skipWaiting(); });
+
+// Reminders from the server. The payload is { title, body, url, tag }.
+self.addEventListener('push', (e) => {
+  let d = {};
+  try { d = e.data ? e.data.json() : {}; } catch { d = { body: e.data?.text() || '' }; }
+  e.waitUntil(self.registration.showNotification(d.title || 'Travel Pack', {
+    body: d.body || '', tag: d.tag || undefined, renotify: !!d.tag,
+    icon: './icons/icon-192.png', badge: './icons/badge-96.png', data: { url: d.url || '#/today' },
+  }));
+});
+
+// Tapping a reminder opens that page: in the app if it is open, else a new window.
+self.addEventListener('notificationclick', (e) => {
+  e.notification.close();
+  const hash = e.notification.data?.url || '#/today';
+  e.waitUntil((async () => {
+    const wins = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    const app = wins.find((c) => c.url.startsWith(self.registration.scope));
+    if (app) { await app.focus(); app.postMessage({ nav: hash }); return; }
+    await self.clients.openWindow(new URL(hash, self.registration.scope).href);
+  })());
+});
 
 function inboxDb() {
   return new Promise((resolve, reject) => {

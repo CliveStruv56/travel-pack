@@ -222,3 +222,38 @@ It is now ${now || new Date().toISOString()} (the traveller is in the UK unless 
   });
   return out;
 }
+
+const BRIEFING_SCHEMA = {
+  type: 'object', additionalProperties: false, required: ['headline', 'summary', 'watch'],
+  properties: {
+    headline: { type: 'string' },
+    summary: { type: 'string' },
+    watch: { type: 'array', items: { type: 'string' } },
+  },
+};
+
+/**
+ * A short morning briefing for one day of the trip. `weather` and `risks` come
+ * from the phone, which already holds the forecast; the model only writes.
+ */
+export async function morningBriefing({ trip, date, weather = [], risks = [], now }) {
+  if (!trip || !/^\d{4}-\d{2}-\d{2}$/.test(date || '')) throw httpError(400, 'Which day?');
+  const tripData = { ...trip };
+  delete tripData.deleted;
+  delete tripData.journal;
+  return callJson({
+    system: `You write the morning briefing in Travel Pack, a personal trip app, for a traveller reading it on their phone over breakfast. British English, warm but brisk, no markdown.
+
+- headline: one short line that sums up the day (e.g. "Ferry night: Kirkwall to Aberdeen").
+- summary: 2 to 4 short sentences walking through the day in time order with the times, places and booking references that matter. Mention when to set off where it helps, using general knowledge of the places (allow time to reach airports, terminals and stations) and say it is a suggestion.
+- watch: 0 to 4 short points that need attention today: weather that could disrupt a leg (and its Plan B if the trip has one), tight connections, check-out times, things still to book or pay. Empty if nothing needs attention.
+
+Use the trip data as the only source of truth for bookings. Do not invent bookings, times or references. The weather given is a forecast; say so if you rely on it.
+
+It is now ${now || new Date().toISOString()}. The briefing is for ${date}.`,
+    content: [{ type: 'text', text: `Trip data (JSON):\n${JSON.stringify(tripData)}\n\nForecast for today's places:\n${JSON.stringify(weather).slice(0, 4000)}\n\nLegs the app flags as weather-sensitive or at risk:\n${JSON.stringify(risks).slice(0, 2000)}\n\nWrite the briefing for ${date}.` }],
+    schema: BRIEFING_SCHEMA,
+    effort: 'low',
+    maxTokens: 8000,
+  });
+}

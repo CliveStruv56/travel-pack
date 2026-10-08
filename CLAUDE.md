@@ -37,5 +37,7 @@ bookings and ticket barcodes on an Android phone. See README.md for features and
     `server/sdk.test.mjs` checks the real SDK's wire format in CI.
   - Access: `USERS` owners see every trip; invited members (one-time `#join=` codes, `/api/invites/redeem`) see only
     their trips. Every trip and file route checks `canSee`; `server.test.mjs` asserts the scoping.
+  - Reminders: `server/reminders.mjs` is pure (plan + due); `server/push.mjs` is dependency-free Web Push. Keep the push-host
+    allowlist in `server/index.mjs` (SSRF guard) and the RFC 8291 vector test. Mark a reminder sent only when the push service accepted it.
   - Documents (`tripId: '__docs'`) are personal and never synced. Secrets live only in server environment variables.
 - Deploy is `.github/workflows/ci.yml`: tests on every push and PR, then GitHub Pages from `main`.
