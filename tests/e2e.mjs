@@ -332,7 +332,7 @@ await section('Journal', async () => {
   await p.waitForSelector('.journal-entry');
   ok((await p.textContent('.journal-entry')).includes('Fish supper'), 'entry saved');
   await p.click('.journal-entry [data-act=add-files]');
-  ok((await p.getAttribute('#file-input', 'accept')) === 'image/*', 'journal picker offers images only');
+  ok((await p.getAttribute('#file-input', 'accept')) === 'image/*,video/*', 'journal picker offers photos and videos');
   await p.setInputFiles('#file-input', OUT + 'fake-pass.png');
   await p.waitForSelector('.journal-entry .photo-grid img');
   ok(true, 'photo added to an existing entry');
@@ -346,6 +346,23 @@ await section('Journal', async () => {
   await p.click('.journal-entry .photo-grid a');
   await p.waitForSelector('.viewer');
   ok((await p.textContent('.v-title')).includes('Journal'), 'photo opens full screen');
+  // A video, straight from the camera button.
+  await p.goBack();
+  await p.waitForSelector('form[data-form=journal]');
+  ok(!!(await p.$('form[data-form=journal] input[name=video][capture=environment][accept="video/*"]')), 'Video button records with the camera');
+  await p.setInputFiles('form[data-form=journal] input[name=video]', { name: 'harbour.mp4', mimeType: 'video/mp4', buffer: Buffer.alloc(4096, 1) });
+  ok((await p.textContent('.jn-previews')).includes('1 video'), 'chosen video previews before saving');
+  await p.fill('form[data-form=journal] textarea', 'Seals in the harbour.');
+  await p.evaluate(() => window.__tp.scheduleQuietRender());
+  await p.waitForTimeout(700);
+  ok((await p.inputValue('form[data-form=journal] textarea')) === 'Seals in the harbour.' && (await p.textContent('.jn-previews')).includes('1 video'),
+    'a background refresh (weather, a sync) does not wipe a half-written entry');
+  await p.click('form[data-form=journal] button.primary');
+  await p.waitForSelector('.journal-entry .vid-tile video', { state: 'attached' });
+  ok(await p.evaluate(() => window.__tp.S.files.some((f) => f.type === 'video/mp4' && f.size === 4096)), 'video saved as recorded, not shrunk');
+  await p.click('.journal-entry .vid-tile');
+  await p.waitForSelector('.viewer video.v-video[controls]');
+  ok(!(await p.$('.viewer .v-body[data-act]')), 'video plays in the viewer with its own controls');
   await p.goto(at('2030-05-09T21:00', 'today'));
   await p.waitForSelector('a.tip[href^="#/journal/"]');
   ok((await p.$$('.jn-strip img')).length >= 3, "Today's journal card shows the day's photos");
@@ -456,6 +473,8 @@ await section('Server: live sharing between two phones, AI, Gmail', async () => 
   ok(!!(await sam.$('.install-card')), 'after joining, the app shows how to put it on the home screen');
   await sam.waitForFunction(() => window.__tp.S.files.length >= 2, null, { timeout: 15000 }).catch(() => {});
   ok(await sam.evaluate(() => window.__tp.S.files.length >= 2), 'tickets follow onto the new phone');
+  await sam.waitForFunction(() => window.__tp.S.files.some((f) => f.type === 'video/mp4'), null, { timeout: 15000 }).catch(() => {});
+  ok(await sam.evaluate(() => window.__tp.S.files.some((f) => f.type === 'video/mp4' && f.size === 4096)), 'journal videos are shared too');
   await shot(sam, '43-joined-today');
   ok(await sam.evaluate(() => window.__tp.S.docs.length === 0), 'documents are not shared');
 

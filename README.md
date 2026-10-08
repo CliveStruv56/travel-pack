@@ -30,7 +30,7 @@ It has no server, no account and no third-party code.
 
 ### Also
 - **Documents**: passport, insurance, railcard, with expiry warnings. They stay on the phone and are never synced.
-- **Journal**: a few lines and photos for each day.
+- **Journal**: a few lines, photos and videos for each day. Videos are kept as recorded; ones over 100 MB stay on the phone that took them rather than syncing.
 - **Weather & Plan B**: forecasts for each day. Island flights and ferries are flagged when gusts or fog could
   disrupt them, with your Plan B shown alongside.
 

@@ -154,6 +154,16 @@ test('files: upload, list, download, tombstone', async () => {
   assert.equal((await call('/api/files/..%2Fx?trip=trip_s', { method: 'PUT', body: Buffer.from('x') })).status, 400);
 });
 
+test('files: videos may be larger than tickets, up to their own limit', async () => {
+  const big = Buffer.alloc(25 * 1024 * 1024, 1);
+  const meta = Buffer.from(JSON.stringify({ name: 'v.mp4', itemId: 'j_1' })).toString('base64');
+  assert.equal((await call('/api/files/f_png?trip=trip_s', { method: 'PUT', body: big, headers: { 'Content-Type': 'image/png', 'X-File-Meta': meta } })).status, 413);
+  assert.equal((await call('/api/files/f_vid?trip=trip_s', { method: 'PUT', body: big, headers: { 'Content-Type': 'video/mp4', 'X-File-Meta': meta } })).status, 200);
+  const t = (await (await call('/api/trips/trip_s')).json()).trip;
+  tombstone(t, 'f_vid', '2030-01-05T00:00:00.000Z');
+  await call('/api/trips/trip_s/sync', { method: 'POST', body: { trip: t } });
+});
+
 test('invites: one-time link gives a new phone access to that trip only', async () => {
   // A second trip the invited person must never see.
   const other = { ...baseTrip(), id: 'trip_other', name: 'Private' };

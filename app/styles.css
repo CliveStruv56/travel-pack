@@ -574,3 +574,17 @@ input[type=date], input[type=time] { min-width: 0; -webkit-appearance: none; app
 .invite-ready .btn.xs { align-self: center; }
 .install-card .hint { margin: 0; }
 .install-card .btn.xs { align-self: flex-end; }
+
+/* Journal videos */
+.vid-tile { position: relative; display: block; width: 100%; height: 100%; }
+.vid-tile video { width: 100%; height: 100%; object-fit: cover; display: block; background: #000; pointer-events: none; }
+.play-badge { position: absolute; inset: 0; margin: auto; width: 34px; height: 34px; border-radius: 50%; display: grid; place-items: center; background: rgb(0 0 0 / .55); color: #fff; }
+.play-badge .i { fill: currentColor; }
+.jn-strip .vid-tile { width: 44px; height: 44px; border-radius: 8px; overflow: hidden; }
+.jn-strip .play-badge { width: 20px; height: 20px; }
+.jn-strip .play-badge .i { width: 11px; height: 11px; }
+.jn-previews video { width: 56px; height: 56px; object-fit: cover; border-radius: 8px; background: #000; }
+.v-video { max-width: 100%; max-height: 100%; width: 100%; background: #000; }
+.v-note { color: #cbd5e1; text-align: center; margin: 8px 0 0; }
+.jn-actions { flex-wrap: wrap; }
+.jn-actions .btn.primary { flex-basis: 100%; }

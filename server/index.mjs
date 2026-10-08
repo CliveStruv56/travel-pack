@@ -23,6 +23,8 @@ import * as gm from './gmail.mjs';
 
 const JSON_LIMIT = 40 * 1024 * 1024;
 const FILE_LIMIT = 20 * 1024 * 1024;
+// Journal videos are kept as recorded; the app keeps larger ones on the phone.
+const VIDEO_LIMIT = 100 * 1024 * 1024;
 const ID = /^[A-Za-z0-9_-]{1,80}$/;
 
 function httpError(status, message) {
@@ -134,7 +136,8 @@ export function createApp(opts = {}) {
     if (old) visible(who, old.tripId);
     let meta = {};
     try { meta = JSON.parse(Buffer.from(req.headers['x-file-meta'] || '', 'base64').toString('utf8') || '{}'); } catch { throw httpError(400, 'Bad meta'); }
-    const blob = await readBody(req, FILE_LIMIT);
+    const isVideo = /^video\//.test(req.headers['content-type'] || '');
+    const blob = await readBody(req, isVideo ? VIDEO_LIMIT : FILE_LIMIT);
     if (!blob.length) throw httpError(400, 'Empty file');
     db.putFile(id, tripId, meta, req.headers['content-type'] || 'application/octet-stream', blob);
     return { ok: true };
@@ -310,5 +313,7 @@ export function createApp(opts = {}) {
 if (import.meta.url === `file://${process.argv[1]}`) {
   const app = createApp();
   const port = Number(process.env.PORT || 8787);
-  createServer(app.handle).listen(port, () => console.log(`Travel Pack server on :${port}`));
+  const server = createServer(app.handle);
+  server.requestTimeout = 20 * 60000; // a large video upload over a slow mobile connection
+  server.listen(port, () => console.log(`Travel Pack server on :${port}`));
 }

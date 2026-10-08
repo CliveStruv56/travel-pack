@@ -456,7 +456,7 @@ VIEWS.today = (t) => {
       const tm = days.find((d) => d.date === addDays(today, 1));
       return tm && tm.entries.some((e) => e.kind !== 'night') ? html`<h2 class="sec-h">Tomorrow · ${fmtDay(tm.date)}</h2>${tm.entries.filter((e) => e.kind !== 'night' && e.kind !== 'gap').slice(0, 3).map((e) => entryCard(e))}` : '';
     })() : ''}
-    ${!before && !t.readOnly ? html`<a class="card tip" href="#/journal/${after ? t.end : today}">${icon('edit')}<div><b>${after ? 'Trip journal' : "Today's journal"}</b>${journalPhotos(t, today).length ? html`<span class="jn-strip">${journalPhotos(t, today).slice(0, 4).map((f) => html`<img src="${fileUrl(f)}" alt="">`)}</span>` : ''}<span>${journalCount(t, today) ? `${journalCount(t, today)} entr${journalCount(t, today) === 1 ? 'y' : 'ies'} today` : 'A few lines and photos to remember the day by.'}</span></div>${icon('right', 'sm dim')}</a>` : ''}
+    ${!before && !t.readOnly ? html`<a class="card tip" href="#/journal/${after ? t.end : today}">${icon('edit')}<div><b>${after ? 'Trip journal' : "Today's journal"}</b>${journalPhotos(t, today).length ? html`<span class="jn-strip">${journalPhotos(t, today).slice(0, 4).map((f) => mediaTile(f))}</span>` : ''}<span>${journalCount(t, today) ? `${journalCount(t, today)} entr${journalCount(t, today) === 1 ? 'y' : 'ies'} today` : 'A few lines and photos to remember the day by.'}</span></div>${icon('right', 'sm dim')}</a>` : ''}
     ${!t.readOnly ? html`<button class="fab" data-act="new-item" data-date="${today >= t.start && today <= t.end ? today : ''}" aria-label="Add booking">${icon('plus')}</button>` : ''}
   </div>`;
 };
@@ -1090,8 +1090,9 @@ function viewerFor(f, ctx) {
     <header class="v-top"><a class="icon-btn" href="${ctx.back}" aria-label="Close">${icon('x')}</a>
       <div class="v-title"><b>${ctx.title}</b><small>${ctx.sub}${ctx.siblings.length > 1 ? ` · ${pos + 1} of ${ctx.siblings.length}` : ''}</small></div>
       ${!readOnly() ? html`<button class="icon-btn" data-act="del-file" data-file="${f.id}" aria-label="Delete">${icon('trash')}</button>` : ''}</header>
-    <div class="v-body ${crop ? 'crop' : ''}" data-act="toggle-crop">
-      ${img ? (crop ? html`<canvas data-crop="${f.id}" aria-label="Barcode"></canvas>` : html`<img src="${fileUrl(f)}" alt="">`)
+    <div class="v-body ${crop ? 'crop' : ''}" ${isVideo(f) ? '' : raw('data-act="toggle-crop"')}>
+      ${isVideo(f) ? html`<video class="v-video" src="${fileUrl(f)}" controls playsinline preload="metadata"></video>${f.localOnly ? html`<p class="hint v-note">Too large to share (over ${fmtBytes(VIDEO_SYNC_LIMIT)}): kept on this phone only.</p>` : ''}`
+      : img ? (crop ? html`<canvas data-crop="${f.id}" aria-label="Barcode"></canvas>` : html`<img src="${fileUrl(f)}" alt="">`)
         : html`<div class="v-pdf">${icon('file')}<p><b>${f.name}</b></p><button class="btn primary" data-act="open-file" data-file="${f.id}">${icon('external')} Open</button></div>`}
     </div>
     <footer class="v-foot">
@@ -1280,6 +1281,15 @@ const journalPhotos = (t, date) => {
   return S.files.filter((f) => ids.has(f.itemId));
 };
 
+const isVideo = (f) => !!f?.type?.startsWith('video/');
+
+/** A journal photo or video as a still tile. Videos show their first frame and a play badge. */
+function mediaTile(f) {
+  return isVideo(f)
+    ? html`<span class="vid-tile"><video src="${fileUrl(f)}#t=0.1" preload="metadata" muted playsinline aria-label="Journal video"></video><span class="play-badge">${icon('play', 'sm')}</span></span>`
+    : html`<img src="${fileUrl(f)}" alt="Journal photo" loading="lazy">`;
+}
+
 const journalCount = (t, date) => (t?.journal || []).filter((j) => j.date === date).length;
 
 VIEWS.journal = (t, [date]) => {
@@ -1302,8 +1312,8 @@ VIEWS.journal = (t, [date]) => {
         <header><span class="avatar sm">${(j.author || '?').charAt(0).toUpperCase()}</span><b>${j.author || 'Me'}</b><small>${j.at ? hhmm(new Date(j.at)) : ''}</small>
           ${!ro ? html`<button class="icon-btn sm" data-act="journal-edit" data-id="${j.id}" aria-label="Edit entry">${icon('edit')}</button>` : ''}</header>
         ${j.text ? html`<p>${j.text}</p>` : ''}
-        ${photos.length ? html`<div class="photo-grid n${Math.min(photos.length, 3)}">${photos.map((f) => html`<a href="#/ticket/${f.id}"><img src="${fileUrl(f)}" alt="Journal photo" loading="lazy"></a>`)}</div>` : ''}
-        ${!ro ? html`<button class="mini" data-act="add-files" data-item="${j.id}">${icon('image', 'sm')} Add photos</button>` : ''}
+        ${photos.length ? html`<div class="photo-grid n${Math.min(photos.length, 3)}">${photos.map((f) => html`<a href="#/ticket/${f.id}">${mediaTile(f)}</a>`)}</div>` : ''}
+        ${!ro ? html`<button class="mini" data-act="add-files" data-item="${j.id}">${icon('image', 'sm')} Add photos or videos</button>` : ''}
       </article>`;
     })}
     ${!ro ? html`<form class="card journal-new" data-form="journal">
@@ -1311,13 +1321,14 @@ VIEWS.journal = (t, [date]) => {
       <textarea name="text" rows="4" placeholder="${entries.length ? 'Add more…' : 'What happened today? Where did you eat, who did you see?'}"></textarea>
       <div class="jn-previews" aria-live="polite"></div>
       <div class="jn-actions">
-        <label class="btn">${icon('image')} Photos<input type="file" name="photos" accept="image/*" multiple hidden data-change="journal-photos"></label>
-        <label class="btn" aria-label="Take a photo">${icon('camera')} Camera<input type="file" name="camera" accept="image/*" capture="environment" hidden data-change="journal-photos"></label>
+        <label class="btn" aria-label="Add photos or videos">${icon('image')} Gallery<input type="file" name="photos" accept="image/*,video/*" multiple hidden data-change="journal-photos"></label>
+        <label class="btn" aria-label="Take a photo">${icon('camera')} Photo<input type="file" name="camera" accept="image/*" capture="environment" hidden data-change="journal-photos"></label>
+        <label class="btn" aria-label="Record a video">${icon('video')} Video<input type="file" name="video" accept="video/*" capture="environment" hidden data-change="journal-photos"></label>
         <button class="btn primary">${icon('plus')} Add</button>
       </div>
     </form>` : ''}
     ${daysWith.length ? html`<h2 class="sec-h">Days with entries</h2><div class="chips">${daysWith.map((x) => html`<a class="chip-link ${x === d ? 'on' : ''}" href="#/journal/${x}" data-replace>${fmtDay(x)} · ${journalCount(t, x)}</a>`)}</div>` : ''}
-    ${S.synced[t.id] ? html`<p class="hint">Shared live: entries and photos appear on Jane's phone too.</p>` : ''}
+    ${S.synced[t.id] ? html`<p class="hint">Shared live: entries, photos and videos appear on Jane's phone too.</p>` : ''}
   </div>`;
 };
 
@@ -1328,10 +1339,18 @@ VIEWS.journal = (t, [date]) => {
 const wxPending = new Set();
 let wxRenderTimer = null;
 
+/** True while a form on the page holds something typed or picked that is not saved yet. */
+function unsavedInput() {
+  return [...root.querySelectorAll('form textarea, form input[type=file]')].some((el) => (el.type === 'file' ? el.files?.length : el.value.trim()));
+}
+
 function scheduleQuietRender() {
   clearTimeout(wxRenderTimer);
   wxRenderTimer = setTimeout(() => {
     if (['edit', 'new', 'ask'].includes(S.route.name) || sheetRoot.classList.contains('open')) return;
+    // A background refresh (weather, someone else's edit arriving) must not
+    // wipe a half-written journal entry or chosen photos. Try again shortly.
+    if (unsavedInput()) { scheduleQuietRender(); return; }
     const y = window.scrollY;
     render();
     window.scrollTo(0, y);
@@ -1487,8 +1506,9 @@ async function syncFiles(id, t) {
     if (gone[f.id]) { await db.del('files', f.id); changed = true; continue; }
     const r = rmap.get(f.id);
     if (!r) {
+      if (f.localOnly) continue;
       const meta = btoa(unescape(encodeURIComponent(JSON.stringify(fileMeta(f)))));
-      await api(`/api/files/${encodeURIComponent(f.id)}?trip=${encodeURIComponent(id)}`, { method: 'PUT', body: f.blob, headers: { 'Content-Type': f.type || 'application/octet-stream', 'X-File-Meta': meta }, timeout: 120000 });
+      await api(`/api/files/${encodeURIComponent(f.id)}?trip=${encodeURIComponent(id)}`, { method: 'PUT', body: f.blob, headers: { 'Content-Type': f.type || 'application/octet-stream', 'X-File-Meta': meta }, timeout: isVideo(f) ? 900000 : 120000 });
     } else if ((f.metaAt || '') > (r.meta.metaAt || '')) {
       await api(`/api/files/${encodeURIComponent(f.id)}`, { method: 'PATCH', body: { meta: fileMeta(f) } });
     } else if ((r.meta.metaAt || '') > (f.metaAt || '')) {
@@ -1500,7 +1520,7 @@ async function syncFiles(id, t) {
   const have = new Set(local.map((f) => f.id));
   for (const r of remote) {
     if (have.has(r.id) || gone[r.id]) continue;
-    const res = await api(`/api/files/${encodeURIComponent(r.id)}`, { raw: true, timeout: 120000 });
+    const res = await api(`/api/files/${encodeURIComponent(r.id)}`, { raw: true, timeout: isVideo(r) ? 900000 : 120000 });
     const blob = await res.blob();
     await db.put('files', { id: r.id, tripId: id, type: r.type, size: r.size, blob, ...r.meta });
     changed = true;
@@ -1922,21 +1942,32 @@ async function detectBarcode(blob) {
   }
 }
 
+// Larger videos stay on the phone that took them: the server takes up to this
+// size, and every other phone in the trip downloads what is shared.
+const VIDEO_SYNC_LIMIT = 100 * 1024 * 1024;
+
 async function addFiles(itemId, fileList) {
   const t = trip();
   const photos = itemId.startsWith('j_');
   let found = 0;
   const existing = filesFor(itemId).length;
   let i = 0;
+  let videos = 0, big = 0;
   for (const file of fileList) {
+    const raw = file.blob || file;
+    const video = photos && isVideo(raw);
+    if (photos && !video && !raw.type?.startsWith('image/')) continue;
+    if (video) { videos++; if (raw.size > VIDEO_SYNC_LIMIT) big++; }
     // Journal photos are kept at 2048px: plenty for a phone screen, and a
-    // fraction of the size to store, back up and share with Jane.
-    const blob = photos ? await shrinkImage(file.blob || file, 2048, 1200000) : file.blob || file;
+    // fraction of the size to store, back up and share with Jane. Videos are
+    // kept as recorded; the phone cannot re-encode them quickly.
+    const blob = photos && !video ? await shrinkImage(raw, 2048, 1200000) : raw;
     const rec = {
       id: uid('f_'), tripId: t.id, itemId, name: file.name || 'ticket', type: blob.type || file.type,
       size: blob.size, blob, createdAt: new Date().toISOString(), order: existing + i++,
     };
     rec.barcode = photos ? null : await detectBarcode(blob);
+    if (video && blob.size > VIDEO_SYNC_LIMIT) rec.localOnly = true;
     if (rec.barcode) found++;
     await db.put('files', rec);
     S.files.push(rec);
@@ -1944,9 +1975,12 @@ async function addFiles(itemId, fileList) {
   askPersist();
   if (S.synced[t.id]) scheduleSync(t.id);
   render();
-  const n = fileList.length;
+  const n = fileList.length - videos;
   const noun = photos ? 'photo' : 'ticket';
-  toast(`${n} ${noun}${n === 1 ? '' : 's'} added${found ? ` · ${found} barcode${found === 1 ? '' : 's'} found` : ''}`);
+  const what = [n ? `${n} ${noun}${n === 1 ? '' : 's'}` : '', videos ? `${videos} video${videos === 1 ? '' : 's'}` : ''].filter(Boolean).join(' and ');
+  toast(big && S.synced[t.id]
+    ? `${what} added · ${big === 1 ? 'one video is' : `${big} videos are`} over ${fmtBytes(VIDEO_SYNC_LIMIT)}, so ${big === 1 ? 'it stays' : 'they stay'} on this phone only`
+    : `${what} added${found ? ` · ${found} barcode${found === 1 ? '' : 's'} found` : ''}`);
 }
 
 fileInput.addEventListener('change', async () => {
@@ -2114,7 +2148,7 @@ const ACT = {
   'pick-type': (el) => { closeSheet(); S.draft = null; go(`new/${el.dataset.type}${el.dataset.date ? '/' + el.dataset.date : ''}`); },
   'add-files': (el) => {
     pendingItem = el.dataset.item;
-    fileInput.accept = pendingItem.startsWith('j_') ? 'image/*' : 'image/*,application/pdf';
+    fileInput.accept = pendingItem.startsWith('j_') ? 'image/*,video/*' : 'image/*,application/pdf';
     fileInput.click();
   },
   async 'del-item'(el) {
@@ -2492,11 +2526,14 @@ const CHANGE = {
   'journal-photos'(el) {
     const form = el.closest('form');
     const box = form.querySelector('.jn-previews');
-    for (const u of box.querySelectorAll('img')) URL.revokeObjectURL(u.src);
+    for (const u of box.querySelectorAll('img, video')) URL.revokeObjectURL(u.src.split('#')[0]);
     const files = [...form.querySelectorAll('input[type=file]')].flatMap((i) => [...i.files]);
-    box.innerHTML = files.map((f) => (f.type.startsWith('image/') ? `<img src="${URL.createObjectURL(f)}" alt="">` : '<b class="pdf-tile">PDF</b>')).join('');
-    const allImages = files.every((f) => f.type.startsWith('image/'));
-    if (files.length) box.insertAdjacentHTML('beforeend', `<span>${files.length} ${allImages ? 'photo' : 'file'}${files.length === 1 ? '' : 's'}</span>`);
+    box.innerHTML = files.map((f) => (f.type.startsWith('image/') ? `<img src="${URL.createObjectURL(f)}" alt="">`
+      : f.type.startsWith('video/') ? `<video src="${URL.createObjectURL(f)}#t=0.1" preload="metadata" muted playsinline></video>`
+      : '<b class="pdf-tile">PDF</b>')).join('');
+    const nv = files.filter((f) => f.type.startsWith('video/')).length, np = files.length - nv;
+    const words = [np ? `${np} photo${np === 1 ? '' : 's'}` : '', nv ? `${nv} video${nv === 1 ? '' : 's'}` : ''].filter(Boolean).join(', ');
+    if (files.length) box.insertAdjacentHTML('beforeend', `<span>${words}</span>`);
   },
   type(el) {
     const form = el.closest('form');
@@ -2881,7 +2918,7 @@ Object.assign(FORMS, {
   async journal(fd) {
     const t = trip();
     const text = String(fd.get('text') || '').trim();
-    const photos = [...fd.getAll('photos'), ...fd.getAll('camera')].filter((f) => f && f.size && f.type.startsWith('image/'));
+    const photos = [...fd.getAll('photos'), ...fd.getAll('camera'), ...fd.getAll('video')].filter((f) => f && f.size && /^(image|video)\//.test(f.type));
     if (!text && !photos.length) { toast('Write something or add a photo first.'); return; }
     t.journal = t.journal || [];
     const entry = { id: uid('j_'), date: String(fd.get('date')), text, author: S.me || getServer()?.name || '', at: new Date().toISOString() };
@@ -2957,4 +2994,4 @@ document.addEventListener('visibilitychange', () => {
 ACT['goto-inbox'] = () => go('inbox');
 
 // Exposed for debugging from the console.
-window.__tp = { S, db, render };
+window.__tp = { S, db, render, scheduleQuietRender };
