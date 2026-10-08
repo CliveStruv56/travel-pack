@@ -628,7 +628,9 @@ await section('Server: live sharing between two phones, AI, Gmail', async () => 
   ok(pushed.some((x) => x.payload.title === 'Travel Pack reminders are on'), 'turning on sends a test notification through the server');
   await p.waitForSelector('.list-card .row b', { timeout: 10000 });
   ok((await p.textContent('.page')).includes('Flight at 15:50'), 'upcoming reminders are listed');
-  ok((await p.textContent('.page')).includes('Wed, 8 May, 13:50 · Leaves in 2 hours'), 'times shown in UK time');
+  // 15:50 BST departure, reminded two hours before: 13:50 UK time (12:50 UTC), whatever the phone's zone.
+  const flightRow = await p.$$eval('.list-card .row', (rows) => rows.map((r) => r.textContent).find((t) => t.includes('Flight at 15:50')) || '');
+  ok(/\b13:50\b/.test(flightRow) && !/\b12:50\b/.test(flightRow), 'times shown in UK time');
   await shot(p, '46-reminders-on');
   await p.uncheck('input[name=briefing]');
   await p.waitForTimeout(800);
